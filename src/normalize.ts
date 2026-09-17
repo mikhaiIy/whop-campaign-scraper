@@ -1,5 +1,12 @@
 import type { RecordValue } from './parser.js';
 
+export interface CampaignPoint {
+  bucket: string;
+  views: number;
+  submissions: number;
+  spend: number;
+}
+
 export interface Campaign {
   id: string;
   title: string;
@@ -27,6 +34,7 @@ export interface Campaign {
   thumbnail: string | null;
   organizationExperienceId: string | null;
   url: string;
+  chartPoints: CampaignPoint[];
 }
 
 const text = (v: unknown): string => typeof v === 'string' ? v.trim() : '';
@@ -62,5 +70,6 @@ export function normalize(raw: RecordValue, now = Date.now()): Campaign {
     createdAtMs: created, requiresApplication: raw.requiresApplication === true, isVerified: raw.isVerified === true,
     thumbnail: text(raw.thumbnail) || null, organizationExperienceId: text(raw.organizationExperienceId) || null,
     url: `https://contentrewards.com/discover/${encodeURIComponent(id)}`,
+    chartPoints: [],
   };
 }

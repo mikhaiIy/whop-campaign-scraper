@@ -11,6 +11,8 @@ authentication, no cookies, no API key.
 - `npm install`
 - `npm run build`
 - `npm start` starts the server on **stdio**.
+- `node dist/index.js --serve [port]` also starts the local web console
+  (default port `4317`). Stdio keeps working either way.
 
 Verify it works:
 
@@ -32,6 +34,32 @@ The campaign catalog is cached in memory for 5 minutes. `list_campaigns`
 coverage: the server follows the same public JSON API the site uses, page by
 page, so it sees the whole public catalog (currently ~660 campaigns) instead of
 just the first batch. See [Deep fetching](#deep-fetching-pagination).
+
+## Local web console (`--serve`)
+
+```bash
+node dist/index.js --serve          # http://127.0.0.1:4317
+node dist/index.js --serve 8080     # a different port
+```
+
+The server binds to **localhost only** and adds a single-page console next to the
+stdio MCP server. It reuses the same source, cache, and config layer as the MCP
+tools, so the config's `deep_fetch`/`max_pages`/`page_size` settings apply here
+too. Three panels:
+
+- **Campaign table** — live catalog, sortable by CPM, budget remaining, burn rate,
+  creator count and more; filterable by category, platform, type and free text.
+  Shows thumbnails, platform badges, a spend meter, a nearly-exhausted flag, and a
+  sparkline of estimated daily spend per campaign.
+- **Config editor** — build a preset by clicking categories/platforms and setting
+  numeric filters, then write it back to the resolved config file. Only the YAML
+  frontmatter is rewritten; the prose body is preserved byte for byte.
+- **Monitor** — active preset, cache age, fetch mode (JSON API vs HTML fallback),
+  pages fetched, last fetch status and any `deepFetchError`, plus a log of the MCP
+  tool calls agents made against this server instance.
+
+Endpoints: `GET /` (SPA), `GET /api/campaigns`, `GET /api/config`,
+`POST /api/config`, `GET /api/status`, `POST /api/refresh`.
 
 ## Configuration file
 

@@ -156,6 +156,8 @@ export class CampaignSource {
 
   list(): Promise<Campaign[]> { return this.campaigns.get(); }
 
+  refresh(): void { this.campaigns.invalidate(); }
+
   get config(): DeepConfig { return { ...this.options }; }
 
   async detail(id: string) {

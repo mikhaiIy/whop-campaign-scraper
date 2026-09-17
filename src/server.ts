@@ -4,6 +4,7 @@ import { CONFIG_URI, ConfigStore, type ResolvedConfig } from './config.js';
 import { filterShape, filterCampaigns, categoryCounts, type Filters } from './filters.js';
 import { matchKey } from './normalize.js';
 import { CampaignSource, SOURCE, TTL_MS } from './source.js';
+import { ToolLog } from './toolLog.js';
 
 const configSummary = (config: ResolvedConfig) => ({
   configPath: config.path,
@@ -16,14 +17,19 @@ const configSummary = (config: ResolvedConfig) => ({
   configWarnings: config.warnings,
 });
 
-export function createServer(source = new CampaignSource(), configStore = new ConfigStore()) {
+export function createServer(source = new CampaignSource(), configStore = new ConfigStore(), toolLog = new ToolLog()) {
   const server = new McpServer({ name: 'whop-content-rewards-mcp', version: '0.1.0' });
   const annotations = { readOnlyHint: true, destructiveHint: false, openWorldHint: true };
-  const result = async (run: () => Promise<unknown>) => {
+  const result = async (tool: string, args: Record<string, unknown>, run: () => Promise<unknown>) => {
+    const started = Date.now();
     try {
-      return { content: [{ type: 'text' as const, text: JSON.stringify(await run()) }] };
+      const value = await run();
+      toolLog.record(tool, args, true, null, Date.now() - started);
+      return { content: [{ type: 'text' as const, text: JSON.stringify(value) }] };
     } catch (error) {
-      return { isError: true, content: [{ type: 'text' as const, text: error instanceof Error ? error.message : String(error) }] };
+      const message = error instanceof Error ? error.message : String(error);
+      toolLog.record(tool, args, false, message, Date.now() - started);
+      return { isError: true, content: [{ type: 'text' as const, text: message }] };
     }
   };
   const metadata = () => {
@@ -47,7 +53,7 @@ export function createServer(source = new CampaignSource(), configStore = new Co
   server.registerTool('list_campaigns', {
     description: 'Filter the cached public discover catalog. The catalog is built by following the public JSON API cursor page by page; if that fails it falls back to the initial server-rendered batch of about 50. A preset from the config file is applied when one is named, then explicit arguments override individual preset values; the default preset applies when no arguments are given. Categories/platforms match any listed value, case-insensitively; different filters combine with AND. Sort descending. Defaults: newest, limit 50. The response also includes configNotes, the user\'s own description of what they want.',
     inputSchema: { ...filterShape, preset: z.string().trim().min(1).optional() }, annotations,
-  }, args => result(async () => {
+  }, args => result('list_campaigns', args, async () => {
     const config = await applyFetchConfig();
     const warnings = [...config.warnings];
     const presetName = args.preset ?? config.defaultPreset;
@@ -71,11 +77,15 @@ export function createServer(source = new CampaignSource(), configStore = new Co
   server.registerTool('get_campaign', {
     description: 'Fetch a public campaign detail page by UUID, with description, reference materials, and payout rules. Missing requirements are reported, not inferred.',
     inputSchema: { id: z.string().uuid() }, annotations,
-  }, ({ id }) => result(async () => ({ ...await source.detail(id), ...metadata() })));
+  }, args => result('get_campaign', args, async () => {
+    const { id } = args as { id: string };
+    return { ...await source.detail(id), ...metadata() };
+  }));
   server.registerTool('search_campaigns', {
     description: 'Case-insensitive substring search over title, brand and description in the cached public catalog.',
     inputSchema: { query: z.string().trim().min(1).max(1000), limit: z.number().int().min(1).max(500).optional() }, annotations,
-  }, ({ query, limit }) => result(async () => {
+  }, args => result('search_campaigns', args, async () => {
+    const { query, limit } = args as { query: string; limit?: number };
     await applyFetchConfig();
     const all = await source.list();
     const matches = all.filter(c => matchKey(`${c.title}\n${c.brand}\n${c.description}`).includes(matchKey(query)));
@@ -83,14 +93,14 @@ export function createServer(source = new CampaignSource(), configStore = new Co
   }));
   server.registerTool('list_categories', {
     description: 'Return categories and counts derived from the cached public catalog, including Uncategorized.', inputSchema: {}, annotations,
-  }, () => result(async () => {
+  }, args => result('list_categories', args, async () => {
     await applyFetchConfig();
     return { categories: categoryCounts(await source.list()), ...metadata() };
   }));
   server.registerTool('reload_config', {
     description: 'Force an immediate re-read of the Markdown config file, bypassing the mtime hot-reload check, and report the parsed presets, default preset, prose intent, and any warnings.',
     inputSchema: {}, annotations,
-  }, () => result(async () => {
+  }, args => result('reload_config', args, async () => {
     const config = await configStore.reload();
     return { ...configSummary(config), presetNames: Object.keys(config.presets).sort(), presets: config.presets, prose: config.prose };
   }));

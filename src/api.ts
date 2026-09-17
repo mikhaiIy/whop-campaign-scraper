@@ -1,4 +1,4 @@
-import { matchKey, type Campaign } from './normalize.js';
+import { matchKey, type Campaign, type CampaignPoint } from './normalize.js';
 import type { RecordValue } from './parser.js';
 
 export const API_ENDPOINT = 'https://contentrewards.com/api/campaign/campaigns/discover';
@@ -53,6 +53,18 @@ export function normalizeApi(raw: RecordValue, now = Date.now()): Campaign {
     ? raw.categories.filter((c): c is RecordValue => typeof c === 'object' && c !== null && !Array.isArray(c)).map(c => text(c.name)).filter(Boolean)
     : [];
   const rateCents = numeric(raw.primaryPayoutCents) ?? numeric(raw.cpmMinRateCents) ?? numeric(raw.cpmMaxRateCents);
+  const dollarsPerView = rateCents !== null ? rateCents / 100 / 1000 : 0;
+  const chartPoints: CampaignPoint[] = Array.isArray(metrics.chartPoints)
+    ? metrics.chartPoints.filter((p): p is RecordValue => typeof p === 'object' && p !== null && !Array.isArray(p)).map(p => {
+      const views = numeric(p.totalViews) ?? 0;
+      return {
+        bucket: text(p.bucket),
+        views,
+        submissions: numeric(p.approvedSubmissionCount) ?? 0,
+        spend: Math.round(views * dollarsPerView * 100) / 100,
+      };
+    }).filter(p => p.bucket).sort((a, b) => a.bucket.localeCompare(b.bucket))
+    : [];
   const created = Date.parse(text(raw.createdAt));
   const createdAtMs = Number.isFinite(created) ? created : null;
   const ageDays = createdAtMs && createdAtMs > 0 ? (now - createdAtMs) / 86400000 : 0;
@@ -73,5 +85,6 @@ export function normalizeApi(raw: RecordValue, now = Date.now()): Campaign {
     createdAtMs, requiresApplication: raw.requiresApplication === true, isVerified: raw.organizationVerified === true,
     thumbnail: assetUrl(raw.banner), organizationExperienceId: text(raw.organizationExperienceId) || null,
     url: `https://contentrewards.com/discover/${encodeURIComponent(id)}`,
+    chartPoints,
   };
 }

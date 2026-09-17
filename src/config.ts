@@ -1,7 +1,7 @@
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
-import { parse as parseYaml } from 'yaml';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { API_LIMITS } from './api.js';
 import { filterSchema, type Filters } from './filters.js';
 
@@ -97,6 +97,45 @@ export function resolveConfigPaths({ env = process.env, cwd = process.cwd(), hom
 }
 
 const FRONTMATTER = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/;
+
+export interface ConfigWrite {
+  defaultPreset: string | null;
+  presets: Record<string, Filters>;
+  fetch: FetchConfig;
+}
+
+export function splitFrontmatter(text: string): { frontmatter: string | null; body: string } {
+  const match = FRONTMATTER.exec(text);
+  if (!match) return { frontmatter: null, body: text };
+  return { frontmatter: match[1], body: text.slice(match[0].length) };
+}
+
+export function buildConfigText(existing: string, input: ConfigWrite): string {
+  const data: Record<string, unknown> = {
+    default_preset: input.defaultPreset ?? null,
+    deep_fetch: input.fetch.deep,
+    max_pages: input.fetch.maxPages,
+    page_size: input.fetch.pageSize,
+    page_delay_ms: input.fetch.pageDelayMs,
+    presets: input.presets,
+  };
+  const { body } = splitFrontmatter(existing);
+  const frontmatter = `---\n${stringifyYaml(data).trimEnd()}\n---\n`;
+  return body ? `${frontmatter}${body}` : frontmatter;
+}
+
+export async function writeConfigFile(path: string, input: ConfigWrite): Promise<ResolvedConfig> {
+  let existing = '';
+  try {
+    existing = await readFile(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, buildConfigText(existing, input), 'utf8');
+  const info = await stat(path);
+  return { ...parseConfig(await readFile(path, 'utf8'), path), exists: true, mtimeMs: info.mtimeMs };
+}
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -236,5 +275,12 @@ export class ConfigStore {
   async reload(): Promise<ResolvedConfig> {
     this.cache = null;
     return this.get();
+  }
+
+  async write(input: ConfigWrite): Promise<ResolvedConfig> {
+    const current = await this.get();
+    const path = current.path ?? this.paths[this.paths.length - 1];
+    this.cache = await writeConfigFile(path, input);
+    return this.cache;
   }
 }
