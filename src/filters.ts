@@ -4,6 +4,7 @@ import { type Campaign, matchKey } from './normalize.js';
 export const filterShape = {
   categories: z.array(z.string().trim().min(1)).optional(),
   platforms: z.array(z.string().trim().min(1)).optional(),
+  exclude_brands: z.array(z.string().trim().min(1)).optional(),
   type: z.string().trim().min(1).optional(),
   min_cpm: z.number().nonnegative().optional(),
   max_cpm: z.number().nonnegative().optional(),
@@ -22,9 +23,11 @@ export function filterCampaigns(campaigns: Campaign[], filters: Filters = {}): C
   }
   const categories = filters.categories?.map(matchKey);
   const platforms = filters.platforms?.map(matchKey);
+  const excludeBrands = filters.exclude_brands?.map(matchKey);
   const filtered = campaigns.filter(c =>
     (!categories?.length || categories.includes(matchKey(c.category))) &&
     (!platforms?.length || c.platforms.some(p => platforms.includes(matchKey(p)))) &&
+    (!excludeBrands?.length || !excludeBrands.includes(matchKey(c.brand))) &&
     (filters.type === undefined || c.type === matchKey(filters.type)) &&
     (filters.min_cpm === undefined || (c.cpmUsd !== null && c.cpmUsd >= filters.min_cpm)) &&
     (filters.max_cpm === undefined || (c.cpmUsd !== null && c.cpmUsd <= filters.max_cpm)) &&
