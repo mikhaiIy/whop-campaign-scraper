@@ -1,0 +1,247 @@
+{
+  "data": [
+    {
+      "banner": "36061717-9bad-59ae-b59d-da559a1b20c9/campaigns/thumbnails/14f743b2-c5ca-4f3e-8c0d-3010c485005d.png",
+      "budgetCents": 24800000,
+      "categories": [
+        {
+          "id": "personal-brand",
+          "name": "Personal Brand"
+        }
+      ],
+      "cpmMaxRateCents": 100,
+      "cpmMinRateCents": 100,
+      "createdAt": "2026-08-15T10:40:47.000Z",
+      "description": "Clippe le contenu de Yomi Denzel et gagne 1$ pour chaque 1000 vues.",
+      "featuredScore": 1248100,
+      "id": "14f743b2-c5ca-4f3e-8c0d-3010c485005d",
+      "listedAt": "2025-12-01T14:58:37.000Z",
+      "metrics": {
+        "approvedSubmissionCount": 43297,
+        "budgetProgressBps": 9540,
+        "budgetSpentCents": 23659788,
+        "creatorCount": 280,
+        "metricsUpdatedAt": "2026-09-17T10:34:02.000Z",
+        "paidOutCents": 4705871,
+        "totalViews": 1437885953,
+        "topClips": [],
+        "topEarners": []
+      },
+      "name": "FR Yomi Denzel Campagne Principale",
+      "organizationExperienceId": "exp_G3sOXQjjhODJPX",
+      "organizationId": "36061717-9bad-59ae-b59d-da559a1b20c9",
+      "organizationLogoUrl": "organizations/36061717-9bad-59ae-b59d-da559a1b20c9/logo/36061717-9bad-59ae-b59d-da559a1b20c9.4067904576.jpg",
+      "organizationName": "Yomi Denzel Clipping",
+      "organizationVerified": true,
+      "payouts": [
+        {
+          "maxPayoutCents": 10500,
+          "minPayoutCents": 2800,
+          "payoutType": "cpm",
+          "platform": "instagram",
+          "rateCents": 100
+        },
+        {
+          "maxPayoutCents": 10500,
+          "minPayoutCents": 2800,
+          "payoutType": "cpm",
+          "platform": "tiktok",
+          "rateCents": 100
+        },
+        {
+          "maxPayoutCents": 10500,
+          "minPayoutCents": 2800,
+          "payoutType": "cpm",
+          "platform": "youtube",
+          "rateCents": 100
+        }
+      ],
+      "payoutType": "cpm",
+      "platforms": [
+        "instagram",
+        "tiktok",
+        "youtube"
+      ],
+      "primaryPayoutCents": 100,
+      "private": false,
+      "referenceMaterials": [
+        {
+          "mediaType": "external",
+          "type": "brandAsset",
+          "url": "https://drive.google.com/drive/folders/15CRuz33sWIFz5moouuxu2vRS_UO5VpfZ?usp=sharing"
+        }
+      ],
+      "requiresApplication": true,
+      "retainerSpotsTotal": 0,
+      "status": "active",
+      "updatedAt": "2026-09-17T10:34:04.000Z"
+    },
+    {
+      "banner": "a581a2a2-b79c-5f3c-b374-bab179ed49dc/campaigns/thumbnails/24ad920b-d24f-479e-9cef-f22182e4a0c0.jpg",
+      "budgetCents": 10500000,
+      "categories": [],
+      "cpmMaxRateCents": 175,
+      "cpmMinRateCents": 150,
+      "createdAt": "2026-08-26T18:38:51.000Z",
+      "description": "Post Modern Warfare 4 Multiplayer Beta gameplay to TikTok, Instagram Reels, and YouTube Shorts. Edit the source footage into polished clips, do not post it as a raw reel.",
+      "featuredScore": 1105175,
+      "id": "24ad920b-d24f-479e-9cef-f22182e4a0c0",
+      "listedAt": "2026-08-21T23:04:33.000Z",
+      "metrics": {
+        "approvedSubmissionCount": 4348,
+        "budgetProgressBps": 6669,
+        "budgetSpentCents": 7002973,
+        "creatorCount": 962,
+        "metricsUpdatedAt": "2026-09-17T10:34:06.000Z",
+        "paidOutCents": 933837,
+        "totalViews": 139568654,
+        "topClips": [],
+        "topEarners": []
+      },
+      "name": "Call of Duty - Modern Warfare 4 Multiplayer Beta Gameplay Clipping",
+      "organizationExperienceId": "exp_zeADOv9rOOKk2x",
+      "organizationId": "a581a2a2-b79c-5f3c-b374-bab179ed49dc",
+      "organizationLogoUrl": "organizations/a581a2a2-b79c-5f3c-b374-bab179ed49dc/logo/a581a2a2-b79c-5f3c-b374-bab179ed49dc.1e1267ba82.jpg",
+      "organizationName": "Clipping Culture",
+      "organizationVerified": true,
+      "payouts": [
+        {
+          "maxPayoutCents": 250000,
+          "minPayoutCents": 350,
+          "payoutType": "cpm",
+          "platform": "tiktok",
+          "rateCents": 175
+        },
+        {
+          "maxPayoutCents": 250000,
+          "minPayoutCents": 450,
+          "payoutType": "cpm",
+          "platform": "instagram",
+          "rateCents": 150
+        },
+        {
+          "maxPayoutCents": 250000,
+          "minPayoutCents": 525,
+          "payoutType": "cpm",
+          "platform": "youtube",
+          "rateCents": 175
+        }
+      ],
+      "payoutType": "cpm",
+      "platforms": [
+        "instagram",
+        "tiktok",
+        "youtube"
+      ],
+      "primaryPayoutCents": 175,
+      "private": false,
+      "referenceMaterials": [
+        {
+          "mediaType": "external",
+          "type": "brandAsset",
+          "url": "https://docs.google.com/document/d/1AaBbbXTwpIOueM0kFdMC1xB7Leh0Jq3T9C-i6Zowxk4/edit?usp=sharing"
+        }
+      ],
+      "requiresApplication": false,
+      "retainerSpotsTotal": 0,
+      "status": "active",
+      "updatedAt": "2026-09-17T10:34:15.000Z"
+    },
+    {
+      "banner": "95898331-98cb-5af5-aac2-0320b4037a35/campaigns/thumbnails/1db63081-715e-4e04-9b11-fbc1d4e8e700.png",
+      "budgetCents": 15550000,
+      "categories": [
+        {
+          "id": "technology",
+          "name": "Technology"
+        }
+      ],
+      "cpmMaxRateCents": 100,
+      "cpmMinRateCents": 50,
+      "createdAt": "2026-08-15T10:40:48.000Z",
+      "description": "We provide ALL assets needed. Clip and earn $1.00 for every 1000 views.\n\nMUST Read the full Instructions before posting to get your videos approved.",
+      "featuredScore": 1155600,
+      "group": {
+        "campaignIds": [
+          "1db63081-715e-4e04-9b11-fbc1d4e8e700"
+        ],
+        "cover": "organizations/95898331-98cb-5af5-aac2-0320b4037a35/campaign-groups/covers/0ad44d49-0ee5-464d-9e11-2dcc96180dcd.webp",
+        "id": "4c00b171-fde3-4096-b920-e8ed4c3ac3b7",
+        "name": "ForgeGUI [Roblox]"
+      },
+      "id": "1db63081-715e-4e04-9b11-fbc1d4e8e700",
+      "listedAt": "2026-05-06T18:28:44.000Z",
+      "metrics": {
+        "approvedSubmissionCount": 16539,
+        "budgetProgressBps": 9247,
+        "budgetSpentCents": 14380102,
+        "creatorCount": 2839,
+        "metricsUpdatedAt": "2026-09-17T10:34:05.000Z",
+        "paidOutCents": 9640324,
+        "totalViews": 287423076,
+        "topClips": [],
+        "topEarners": []
+      },
+      "name": "ForgeGUI Clipping [Roblox]",
+      "organizationExperienceId": "exp_EfN9ClEYDL8Bh9",
+      "organizationId": "95898331-98cb-5af5-aac2-0320b4037a35",
+      "organizationLogoUrl": "organizations/95898331-98cb-5af5-aac2-0320b4037a35/logo/95898331-98cb-5af5-aac2-0320b4037a35.c02d651ffb.png",
+      "organizationName": "BloxClips",
+      "organizationVerified": true,
+      "payouts": [
+        {
+          "maxPayoutCents": 107600,
+          "minPayoutCents": 100,
+          "payoutType": "cpm",
+          "platform": "tiktok",
+          "rateCents": 100
+        },
+        {
+          "maxPayoutCents": 107600,
+          "minPayoutCents": 100,
+          "payoutType": "cpm",
+          "platform": "instagram",
+          "rateCents": 100
+        },
+        {
+          "maxPayoutCents": 107600,
+          "minPayoutCents": 50,
+          "payoutType": "cpm",
+          "platform": "youtube",
+          "rateCents": 50
+        }
+      ],
+      "payoutType": "cpm",
+      "platforms": [
+        "instagram",
+        "tiktok",
+        "youtube"
+      ],
+      "primaryPayoutCents": 100,
+      "private": false,
+      "referenceMaterials": [
+        {
+          "mediaType": "external",
+          "type": "brandAsset",
+          "url": "https://docs.google.com/document/d/1qO49_v4Qa_JQiRWX8dDe1pi7ZSizvZOFNC8O-YlHDsI/edit?usp=sharing"
+        },
+        {
+          "mediaType": "external",
+          "type": "brandAsset",
+          "url": "https://drive.google.com/drive/folders/1vFXrGZbqmMJbdxwuoEZvZbBXdBQ8c_c-?usp=sharing"
+        }
+      ],
+      "requiresApplication": false,
+      "retainerSpotsTotal": 0,
+      "status": "active",
+      "updatedAt": "2026-09-17T10:34:16.000Z"
+    }
+  ],
+  "pagination": {
+    "count": 3,
+    "limit": 50,
+    "cursor": "X",
+    "nextCursor": "Y"
+  },
+  "success": true
+}

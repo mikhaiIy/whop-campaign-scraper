@@ -77,7 +77,7 @@ test('cache coalesces concurrent loads, expires at five minutes, retries failure
 
 test('source caches list and detail and rejects HTTP failures', async () => {
   let requests = 0;
-  const source = new CampaignSource(async url => { requests++; return new Response(url.endsWith(campaigns[0].id) ? detail : html); });
+  const source = new CampaignSource(async url => { requests++; return new Response(url.endsWith(campaigns[0].id) ? detail : html); }, { deep: false });
   await source.list();
   await source.list();
   const enriched = await source.detail(campaigns[0].id);

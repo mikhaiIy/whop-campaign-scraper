@@ -2,6 +2,7 @@ import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { API_LIMITS } from './api.js';
 import { filterSchema, type Filters } from './filters.js';
 
 export const CONFIG_URI = 'whop://config/notes';
@@ -10,6 +11,18 @@ export const STARTER_CONFIG = `---
 # default_preset names the preset that list_campaigns applies when the caller
 # supplies no explicit arguments. Set it to a key under "presets" below.
 default_preset: example
+
+# Deeper fetching. The public discover page briefly shows about 50 campaigns.
+# The MCP server asks the same public JSON API the site uses, following its
+# cursor page by page, so agents can see the whole public catalog.
+#   deep_fetch:     false keeps the older 50-campaign HTML path only.
+#   max_pages:      how many API pages to request (default 5).
+#   page_size:      records per page, 1-100 (default 50).
+#   page_delay_ms:  pause between page requests, for politeness (default 500).
+deep_fetch: true
+max_pages: 5
+page_size: 50
+page_delay_ms: 500
 
 # Each preset is a named bundle of filters. A caller picks one with the
 # list_campaigns "preset" argument; explicit tool arguments override individual
@@ -46,6 +59,20 @@ it only tells the agent what you are trying to achieve.
 export const CONFIG_FILENAME = 'campaigns.config.md';
 export const DEFAULT_CONFIG_PATH = resolve(homedir(), '.config/whop-mcp', CONFIG_FILENAME);
 
+export interface FetchConfig {
+  deep: boolean;
+  maxPages: number;
+  pageSize: number;
+  pageDelayMs: number;
+}
+
+export const DEFAULT_FETCH: FetchConfig = {
+  deep: true,
+  maxPages: API_LIMITS.maxPages.default,
+  pageSize: API_LIMITS.pageSize.default,
+  pageDelayMs: API_LIMITS.pageDelayMs.default,
+};
+
 export interface ResolvedConfig {
   path: string | null;
   exists: boolean;
@@ -55,6 +82,7 @@ export interface ResolvedConfig {
   warnings: string[];
   mtimeMs: number | null;
   autoCreated: boolean;
+  fetch: FetchConfig;
 }
 
 export interface ConfigPaths {
@@ -72,6 +100,27 @@ const FRONTMATTER = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/;
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const boundedInt = (value: unknown, bounds: { min: number; max: number }, key: string, warnings: string[]): number | null => {
+  if (value === undefined) return null;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < bounds.min || value > bounds.max) {
+    warnings.push(`Config "${key}" must be an integer between ${bounds.min} and ${bounds.max}; it was ignored in favour of the default.`);
+    return null;
+  }
+  return value;
+};
+
+export function parseFetch(data: Record<string, unknown>, warnings: string[]): FetchConfig {
+  const fetch: FetchConfig = { ...DEFAULT_FETCH };
+  if (data.deep_fetch !== undefined) {
+    if (typeof data.deep_fetch === 'boolean') fetch.deep = data.deep_fetch;
+    else warnings.push('Config "deep_fetch" must be true or false; it was ignored in favour of the default.');
+  }
+  fetch.maxPages = boundedInt(data.max_pages, API_LIMITS.maxPages, 'max_pages', warnings) ?? fetch.maxPages;
+  fetch.pageSize = boundedInt(data.page_size, API_LIMITS.pageSize, 'page_size', warnings) ?? fetch.pageSize;
+  fetch.pageDelayMs = boundedInt(data.page_delay_ms, API_LIMITS.pageDelayMs, 'page_delay_ms', warnings) ?? fetch.pageDelayMs;
+  return fetch;
+}
 
 export function parseConfig(text: string, path: string | null = null): ResolvedConfig {
   const warnings: string[] = [];
@@ -122,7 +171,7 @@ export function parseConfig(text: string, path: string | null = null): ResolvedC
     }
   }
 
-  return { path, exists: true, defaultPreset, presets, prose, warnings, mtimeMs: null, autoCreated: false };
+  return { path, exists: true, defaultPreset, presets, prose, warnings, mtimeMs: null, autoCreated: false, fetch: parseFetch(data, warnings) };
 }
 
 export class ConfigStore {
@@ -141,7 +190,7 @@ export class ConfigStore {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
           return {
-            path, exists: false, defaultPreset: null, presets: {}, prose: '', mtimeMs: null, autoCreated: false,
+            path, exists: false, defaultPreset: null, presets: {}, prose: '', mtimeMs: null, autoCreated: false, fetch: { ...DEFAULT_FETCH },
             warnings: [`Config file at ${path} could not be read: ${error instanceof Error ? error.message : String(error)}. No preset filters are applied.`],
           };
         }
@@ -157,7 +206,7 @@ export class ConfigStore {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
         warnings.push(`Could not create a starter config at ${target}: ${error instanceof Error ? error.message : String(error)}. No preset filters are applied.`);
-        return { path: target, exists: false, defaultPreset: null, presets: {}, prose: '', mtimeMs: null, autoCreated: false, warnings };
+        return { path: target, exists: false, defaultPreset: null, presets: {}, prose: '', mtimeMs: null, autoCreated: false, fetch: { ...DEFAULT_FETCH }, warnings };
       }
     }
     try {
@@ -165,7 +214,7 @@ export class ConfigStore {
       return { ...parseConfig(await readFile(target, 'utf8'), target), exists: true, mtimeMs: info.mtimeMs, autoCreated };
     } catch (error) {
       warnings.push(`Config file at ${target} could not be read after creation: ${error instanceof Error ? error.message : String(error)}. No preset filters are applied.`);
-      return { path: target, exists: false, defaultPreset: null, presets: {}, prose: '', mtimeMs: null, autoCreated, warnings };
+      return { path: target, exists: false, defaultPreset: null, presets: {}, prose: '', mtimeMs: null, autoCreated, fetch: { ...DEFAULT_FETCH }, warnings };
     }
   }
 

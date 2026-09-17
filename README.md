@@ -28,9 +28,10 @@ Verify it works:
 | `list_categories` | Categories and counts derived from live data. |
 | `reload_config` | Force an immediate re-read of the config file. |
 
-The campaign batch is cached in memory for 5 minutes. `list_campaigns`
-coverage note: the public source exposes only its initial discover batch
-(normally 50 campaigns), not the complete catalog.
+The campaign catalog is cached in memory for 5 minutes. `list_campaigns`
+coverage: the server follows the same public JSON API the site uses, page by
+page, so it sees the whole public catalog (currently ~660 campaigns) instead of
+just the first batch. See [Deep fetching](#deep-fetching-pagination).
 
 ## Configuration file
 
@@ -81,6 +82,10 @@ numeric filters, so it is worth being specific.
 | --- | --- | --- |
 | `default_preset` | string | Preset applied by `list_campaigns` when no arguments are given. |
 | `presets` | mapping | Named bundles of filters. Any key below can appear in a preset. |
+| `deep_fetch` | boolean | Enable cursor pagination over the public JSON API. Default `true`. |
+| `max_pages` | integer 1-100 | Maximum API pages to request. Default `5`. |
+| `page_size` | integer 1-100 | Records per API page. Default `50`. |
+| `page_delay_ms` | integer 0-10000 | Pause between page requests, for politeness. Default `500`. |
 
 Preset filter keys: `categories`, `platforms`, `exclude_brands`, `type`,
 `min_cpm`, `max_cpm`, `min_budget_remaining`, `requires_application`,
@@ -100,3 +105,49 @@ that argument explicitly.
   needed. `reload_config` bypasses the mtime check and always re-reads.
 - Invalid YAML, an invalid preset, or a `default_preset` that is not defined is
   skipped and reported in `configWarnings`. The server keeps serving campaigns.
+
+## Deep fetching (pagination)
+
+The discover HTML page server-renders only its first ~50 campaigns.
+`?page=2`, `?category=`, `?platform=` and `?sort=` all return that same 50, so
+the web app loads more client-side.
+
+It does this through a public JSON API that needs no authentication and no
+cookies:
+
+```
+GET https://contentrewards.com/api/campaign/campaigns/discover?limit=50&cursor=<opaque>
+```
+
+The response carries `data[]` and `pagination.nextCursor`; passing the cursor
+back walks the catalog forward. As of this writing the whole catalog is ~660
+campaigns and the cursor runs out after ~7 pages of 100.
+
+- This JSON endpoint was found by reading the Next.js client bundles: the
+  discover feed calls an oRPC style client
+  `campaignClient.listDiscover({ limit, cursor })` against
+  `/api/campaign/campaigns/discover`. The raw API is used directly, so no
+  server action replay or headless browser is needed.
+- The JSON records are normalized onto the same internal `Campaign` type as the
+  HTML path (`budgetCents` → dollars, `primaryPayoutCents`/`cpmMinRateCents` →
+  `cpmUsd`, `metrics.budgetProgressBps` → progress, `organizationName` → brand,
+  and so on).
+- `max_pages` caps how deep the server goes (default 5 × 50 = 250 campaigns)
+  and `page_delay_ms` keeps the origin politely paced.
+
+### Graceful degradation
+
+Deeper fetching is strictly additive. If the API request fails for any reason
+(non-200, non-JSON body, timeout), the server silently falls back to the
+original server-rendered HTML path that yields ~50 campaigns. The failure is
+never fatal and is reported in the tool response metadata:
+
+- `fetchMode`: `"api"` or `"html"`.
+- `pagesFetched`: how many API pages were read.
+- `catalogComplete`: `true` when the cursor ran out, `false` when `max_pages`
+  capped the walk.
+- `deepFetchError`: the reason the API path was abandoned, or `null`.
+- `coverage`: a human-readable summary of the above.
+
+Set `deep_fetch: false` to disable the API path entirely and keep the
+50-campaign HTML behavior.

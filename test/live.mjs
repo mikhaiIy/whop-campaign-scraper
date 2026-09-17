@@ -33,6 +33,10 @@ try {
   assert.ok(listed.campaigns.every(c => c.budgetRemaining >= 1));
   assert.ok(listed.configNotes.includes('Initial intent'));
   assert.deepEqual(listed.configWarnings, []);
+  assert.equal(listed.fetchMode, 'api', `expected deep API fetch, got ${listed.fetchMode}: ${listed.deepFetchError}`);
+  assert.equal(listed.pagesFetched, listed.fetchConfig.maxPages);
+  assert.ok(listed.totalFetched > 50, `expected more than the 50-campaign HTML batch, got ${listed.totalFetched}`);
+  assert.ok(listed.coverage.includes('Cursor-paginated'));
   const first = listed.campaigns[0];
 
   const filtered = await call('list_campaigns', { categories: [first.category.toUpperCase()], min_budget_remaining: 0, sort_by: 'cpm', limit: 3 });
@@ -57,7 +61,8 @@ try {
   assert.ok(changed.prose.includes('Changed intent'));
   const unfiltered = await call('list_campaigns');
   assert.equal(unfiltered.appliedPreset, null);
-  assert.equal(unfiltered.returned, unfiltered.totalFetched);
+  assert.equal(unfiltered.returned, 50);
+  assert.ok(unfiltered.totalFetched > 50);
 
   await writeFile(config, '---\ndefault_preset: [unclosed\n---\nBroken frontmatter.\n');
   const broken = await call('list_campaigns');
@@ -67,7 +72,7 @@ try {
 
   const invalid = await client.callTool({ name: 'get_campaign', arguments: { id: '../invalid' } });
   assert.equal(invalid.isError, true);
-  console.log(JSON.stringify({ tools: tools.tools.map(t => t.name), resources: resources.resources.map(r => r.uri), campaigns: listed.totalFetched, presetApplied: true, explicitOverride: true, notesResource: true, hotReload: true, malformedFallback: true, detailId: detail.id, payoutRules: detail.payoutRules.length }, null, 2));
+  console.log(JSON.stringify({ tools: tools.tools.map(t => t.name), resources: resources.resources.map(r => r.uri), fetchMode: listed.fetchMode, pagesFetched: listed.pagesFetched, totalFetched: listed.totalFetched, catalogComplete: listed.catalogComplete, campaigns: listed.totalFetched, presetApplied: true, explicitOverride: true, notesResource: true, hotReload: true, malformedFallback: true, detailId: detail.id, payoutRules: detail.payoutRules.length }, null, 2));
 } finally {
   await client.close();
   await rm(temp, { recursive: true, force: true });
