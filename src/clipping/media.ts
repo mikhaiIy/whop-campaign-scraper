@@ -164,6 +164,28 @@ export class MediaCache {
     return { videoId: video.id, kind: 'audio', section, path, probe: await this.probeCached(path, Boolean(options.refresh)), fromCache, fetchedAt: new Date(this.now()).toISOString() };
   }
 
+  /** Low-resolution full-length proxy, used only to derive visual signals. */
+  async ingestProxy(video: MediaSourceLike, options: { refresh?: boolean; maxHeight?: number } = {}): Promise<MediaAsset> {
+    const height = options.maxHeight ?? 360;
+    const dir = join(this.dir, video.id, 'proxy');
+    const path = join(dir, 'source.mp4');
+    const fromCache = !options.refresh && (await this.exists(path));
+    if (!fromCache) {
+      await mkdir(dir, { recursive: true });
+      const args = [
+        '-f', `bv*[height<=${height}]+ba/b[height<=${height}]/b/worst`,
+        '--merge-output-format', 'mp4', '--remux-video', 'mp4',
+        '--no-playlist', '--no-warnings', '--retries', '2',
+        '-o', join(dir, 'source.%(ext)s'),
+        sourceUrl(video),
+      ];
+      const result = await this.runner(this.command, args, this.downloadTimeoutMs);
+      if (result.code !== 0) throw new Error(`yt-dlp proxy download failed (exit ${result.code}): ${result.stderr.trim().split('\n').slice(-3).join(' ').slice(0, 400) || 'no stderr'}`);
+      if (!(await this.exists(path))) throw new Error(`yt-dlp reported success but ${path} is missing.`);
+    }
+    return { videoId: video.id, kind: 'video', section: null, path, probe: await this.probeCached(path, Boolean(options.refresh)), fromCache, fetchedAt: new Date(this.now()).toISOString() };
+  }
+
   async ingestSection(video: MediaSourceLike, section: SectionRange, options: { refresh?: boolean; maxHeight?: number } = {}): Promise<MediaAsset> {
     if (!(section.end > section.start)) throw new Error(`Video section end must exceed start: ${JSON.stringify(section)}`);
     const height = options.maxHeight ?? 1080;

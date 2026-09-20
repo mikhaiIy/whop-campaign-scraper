@@ -58,6 +58,19 @@ export interface TightenOptions {
   command?: string;
 }
 
+export interface ColdOpenOptions {
+  enabled?: boolean;
+  /** Input-relative start of the teaser (usually the payoff instant). */
+  startSeconds?: number;
+  durationSeconds?: number;
+}
+
+export interface ResolvedColdOpenOptions {
+  enabled: boolean;
+  startSeconds: number;
+  durationSeconds: number;
+}
+
 export interface RenderRequest {
   campaignId: string;
   videoId: string;
@@ -72,6 +85,7 @@ export interface RenderRequest {
   loudness?: LoudnessOptions;
   tighten?: TightenOptions;
   reframe?: ReframeOptions;
+  coldOpen?: ColdOpenOptions;
 }
 
 export interface RenderDeps {
@@ -104,6 +118,7 @@ export interface LoudnormMeasurement {
 export interface RenderStageReport {
   tighten: { ran: boolean; command: string; args: string[]; output: string | null; warning: string | null };
   reframe: { ran: boolean; filter: string | null; focusX: number | null; focusSource: 'request' | 'face' | 'center' };
+  coldOpen: { ran: boolean; startSeconds: number; durationSeconds: number };
   captions: { ran: boolean; path: string | null; cards: number; warnings: string[] };
   loudness: { ran: boolean; measured: LoudnormMeasurement | null };
 }
@@ -219,7 +234,23 @@ export function resolveReframeOptions(options: ReframeOptions = {}): ResolvedRef
   };
 }
 
-const toEven = (value: number): number => (value % 2 === 0 ? value : value + 1);/**
+const toEven = (value: number): number => (value % 2 === 0 ? value : value + 1);
+
+/** Teaser flash of the payoff prepended before the setup; default off. */
+export function resolveColdOpenOptions(options: ColdOpenOptions = {}, clipDuration = 0): ResolvedColdOpenOptions {
+  const durationSeconds = Math.max(0, Math.min(2, asNumber(options.durationSeconds, 0.8)));
+  const maxStart = Math.max(0, clipDuration - durationSeconds);
+  const startSeconds = Math.min(Math.max(0, asNumber(options.startSeconds, 0)), maxStart);
+  const enabled = (options.enabled ?? false) && durationSeconds > 0 && clipDuration > durationSeconds + 1;
+  return { enabled, startSeconds, durationSeconds };
+}
+
+function loudnormFilter(loudness: Required<LoudnessOptions>, measured: LoudnormMeasurement | null | undefined): string {
+  const measuredArgs = measured
+    ? `:measured_I=${measured.input_i}:measured_TP=${measured.input_tp}:measured_LRA=${measured.input_lra}:measured_thresh=${measured.input_thresh}:offset=${measured.target_offset}`
+    : '';
+  return `loudnorm=I=${loudness.targetI}:TP=${loudness.targetTP}:LRA=${loudness.targetLRA}${measuredArgs}:linear=${loudness.linear ? 'true' : 'false'}`;
+}/**
  * Scale-to-cover, then crop to the target, centering horizontally on `focusX`.
  * Returns null when the input already matches the target size.
  */
@@ -367,7 +398,7 @@ function pickKeyword(card: CaptionCard): number {
  * Build an ASS subtitle document for the words inside [clipStart, clipEnd].
  * Times are clip-relative: the first clip frame is 0.
  */
-export function buildAss(transcript: Transcript, clipStart: number, clipEnd: number, options: CaptionOptions = {}): AssBuildResult {
+export function buildAss(transcript: Transcript, clipStart: number, clipEnd: number, options: CaptionOptions = {}, timeOffsetSeconds = 0): AssBuildResult {
   const resolved = resolveCaptionOptions(options);
   const inRange = flattenWords(transcript)
     .filter(word => word.end > clipStart && word.start < clipEnd)
@@ -392,7 +423,7 @@ export function buildAss(transcript: Transcript, clipStart: number, clipEnd: num
     }).join(' ');
     const cps = card.end > card.start ? (card.words.map(word => word.word).join(' ').length / (card.end - card.start)) : 0;
     if (cps > 20) warnings.push(`caption card at ${card.start.toFixed(2)}s reads at ${cps.toFixed(1)} CPS (>20).`);
-    return `Dialogue: 0,${formatAssTime(card.start)},${formatAssTime(card.end)},Caption,,0,0,0,,${text}`;
+    return `Dialogue: 0,${formatAssTime(card.start + timeOffsetSeconds)},${formatAssTime(card.end + timeOffsetSeconds)},Caption,,0,0,0,,${text}`;
   });
 
   const ass = [
@@ -451,19 +482,30 @@ export function ffmpegSubtitlesFilter(assPath: string): string {
   return `subtitles=filename='${escapeFilterPath(assPath)}'`;
 }
 
-export function buildRenderArgs(request: { inputPath: string; outputPath: string; assPath?: string | null; reframeFilter?: string | null; loudness?: Required<LoudnessOptions>; measured?: LoudnormMeasurement | null }): string[] {
+export function buildRenderArgs(request: { inputPath: string; outputPath: string; assPath?: string | null; reframeFilter?: string | null; coldOpen?: { startSeconds: number; durationSeconds: number } | null; loudness?: Required<LoudnessOptions>; measured?: LoudnormMeasurement | null }): string[] {
   const args = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-i', request.inputPath];
-  const filters: string[] = [];
-  if (request.reframeFilter) filters.push(request.reframeFilter);
-  if (request.assPath) filters.push(ffmpegSubtitlesFilter(request.assPath));
-  if (filters.length) args.push('-vf', filters.join(','));
-  if (request.loudness?.enabled) {
-    const loud = request.loudness;
-    const measured = request.measured;
-    const measuredArgs = measured
-      ? `:measured_I=${measured.input_i}:measured_TP=${measured.input_tp}:measured_LRA=${measured.input_lra}:measured_thresh=${measured.input_thresh}:offset=${measured.target_offset}`
-      : '';
-    args.push('-af', `loudnorm=I=${loud.targetI}:TP=${loud.targetTP}:LRA=${loud.targetLRA}${measuredArgs}:linear=${loud.linear ? 'true' : 'false'}`);
+  const cold = request.coldOpen && request.coldOpen.durationSeconds > 0 ? request.coldOpen : null;
+  if (cold) {
+    const pre = request.reframeFilter ? `${request.reframeFilter},` : '';
+    const subs = request.assPath ? `[vcat]${ffmpegSubtitlesFilter(request.assPath)}[vout]` : null;
+    const loud = request.loudness?.enabled ? `[acat]${loudnormFilter(request.loudness, request.measured)}[aout]` : null;
+    const complex = [
+      `[0:v]trim=start=${cold.startSeconds}:duration=${cold.durationSeconds},setpts=PTS-STARTPTS,${pre}format=yuv420p,setsar=1[v0]`,
+      `[0:v]setpts=PTS-STARTPTS,${pre}format=yuv420p,setsar=1[v1]`,
+      '[v0][v1]concat=n=2:v=1:a=0[vcat]',
+      ...(subs ? [subs] : []),
+      `[0:a]atrim=start=${cold.startSeconds}:duration=${cold.durationSeconds},asetpts=PTS-STARTPTS[a0]`,
+      '[0:a]asetpts=PTS-STARTPTS[a1]',
+      '[a0][a1]concat=n=2:v=0:a=1[acat]',
+      ...(loud ? [loud] : []),
+    ].join(';');
+    args.push('-filter_complex', complex, '-map', subs ? '[vout]' : '[vcat]', '-map', loud ? '[aout]' : '[acat]');
+  } else {
+    const filters: string[] = [];
+    if (request.reframeFilter) filters.push(request.reframeFilter);
+    if (request.assPath) filters.push(ffmpegSubtitlesFilter(request.assPath));
+    if (filters.length) args.push('-vf', filters.join(','));
+    if (request.loudness?.enabled) args.push('-af', loudnormFilter(request.loudness, request.measured));
   }
   args.push(
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
@@ -506,16 +548,17 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
   const loudness = resolveLoudnessOptions(request.loudness);
   const tighten = resolveTightenOptions(request.tighten);
   const reframe = resolveReframeOptions(request.reframe);
+  const coldOpen = resolveColdOpenOptions(request.coldOpen, Math.max(0, request.clipEnd - request.clipStart));
+  const expectedDuration = Math.max(0, request.clipEnd - request.clipStart) + (coldOpen.enabled ? coldOpen.durationSeconds : 0);
   await mkdir(dirname(request.outputPath), { recursive: true });
 
   if (!deps.refresh && (await stat(request.outputPath).catch(() => null))) {
     try {
       const probe = await probeMedia(request.outputPath, { command: probeCommand, runner, timeoutMs: 60_000 });
-      const expected = request.clipEnd - request.clipStart;
-      if (probe.durationSeconds > 0 && Math.abs(probe.durationSeconds - expected) <= tolerance) {
+      if (probe.durationSeconds > 0 && Math.abs(probe.durationSeconds - expectedDuration) <= tolerance) {
         return {
           outputPath: request.outputPath, sidecarPath: request.sidecarPath, assPath: null, probe, fromCache: true,
-          stages: { tighten: { ran: false, command: tighten.command, args: [], output: null, warning: null }, reframe: { ran: false, filter: null, focusX: reframe.focusX, focusSource: reframe.focusX === null ? 'center' : 'request' }, captions: { ran: false, path: null, cards: 0, warnings: [] }, loudness: { ran: false, measured: null } },
+          stages: { tighten: { ran: false, command: tighten.command, args: [], output: null, warning: null }, reframe: { ran: false, filter: null, focusX: reframe.focusX, focusSource: reframe.focusX === null ? 'center' : 'request' }, coldOpen: { ran: false, startSeconds: coldOpen.startSeconds, durationSeconds: coldOpen.durationSeconds }, captions: { ran: false, path: null, cards: 0, warnings: [] }, loudness: { ran: false, measured: null } },
         };
       }
     } catch { /* unreadable; re-render */ }
@@ -524,6 +567,7 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
   const stageReport: RenderStageReport = {
     tighten: { ran: false, command: tighten.command, args: [], output: null, warning: null },
     reframe: { ran: false, filter: null, focusX: reframe.focusX, focusSource: reframe.focusX === null ? 'center' : 'request' },
+    coldOpen: { ran: coldOpen.enabled, startSeconds: coldOpen.startSeconds, durationSeconds: coldOpen.durationSeconds },
     captions: { ran: false, path: null, cards: 0, warnings: [] },
     loudness: { ran: false, measured: null },
   };
@@ -568,7 +612,7 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
     canvas.height = DEFAULT_CANVAS.height;
   }
   if (captions.enabled) {
-    const built = buildAss(request.transcript, request.clipStart, request.clipEnd, { ...request.captions, canvas });
+    const built = buildAss(request.transcript, request.clipStart, request.clipEnd, { ...request.captions, canvas }, coldOpen.enabled ? coldOpen.durationSeconds : 0);
     stageReport.captions.cards = built.cards.length;
     stageReport.captions.warnings = built.warnings;
     if (built.cards.length) {
@@ -589,7 +633,7 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
     }
   }
 
-  const args = buildRenderArgs({ inputPath: workingInput, outputPath: request.outputPath, assPath, reframeFilter: stageReport.reframe.filter, loudness, measured: stageReport.loudness.measured });
+  const args = buildRenderArgs({ inputPath: workingInput, outputPath: request.outputPath, assPath, reframeFilter: stageReport.reframe.filter, coldOpen: coldOpen.enabled ? { startSeconds: coldOpen.startSeconds, durationSeconds: coldOpen.durationSeconds } : null, loudness, measured: stageReport.loudness.measured });
   const result = await runner(ffmpeg, args, timeoutMs);
   if (result.code !== 0) {
     throw new Error(`render ffmpeg failed (exit ${result.code}): ${result.stderr.trim().split('\n').slice(-3).join(' ').slice(0, 500) || 'no stderr'}`);
@@ -598,9 +642,9 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
   if (!(probe.durationSeconds > 0)) {
     throw new Error(`render produced a zero-length clip at ${request.outputPath} (ffprobe duration ${probe.durationSeconds}).`);
   }
-  const delta = Math.abs(probe.durationSeconds - (request.clipEnd - request.clipStart));
+  const delta = Math.abs(probe.durationSeconds - expectedDuration);
   if (delta > tolerance) {
-    throw new Error(`Render duration mismatch: expected ${(request.clipEnd - request.clipStart).toFixed(3)}s, ffprobe reports ${probe.durationSeconds.toFixed(3)}s (delta ${delta.toFixed(3)}s > ${tolerance}s).`);
+    throw new Error(`Render duration mismatch: expected ${expectedDuration.toFixed(3)}s, ffprobe reports ${probe.durationSeconds.toFixed(3)}s (delta ${delta.toFixed(3)}s > ${tolerance}s).`);
   }
   await writeFile(request.sidecarPath, JSON.stringify(buildSidecar(request, probe, stageReport, loudness, args, now), null, 2), 'utf8');
   return { outputPath: request.outputPath, sidecarPath: request.sidecarPath, assPath, probe, stages: stageReport, fromCache: false };

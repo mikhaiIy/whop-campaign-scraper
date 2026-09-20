@@ -1,6 +1,6 @@
 import type { ClipSpec, Field, Provenance } from './extract.js';
 import type { TextLlm } from './llm.js';
-import { energyAt, peakTimeWithin, topEnergyWindows, type MediaSignals } from './signals.js';
+import { allPeaks, energyAt, peakTimeWithin, topEnergyWindows, type MediaSignals, type TimeRange } from './signals.js';
 import { flattenWords, transcriptDuration, type Transcript, type TranscriptSegment, type WordTiming } from './transcribe.js';
 
 export const MOMENT_PROMPT_VERSION = 'moments-v1';
@@ -40,6 +40,8 @@ export interface MomentCandidate {
   audioEnergyDb?: number | null;
   /** Loudest timestamp inside the moment, when audio signals are available. */
   signalPeakSeconds?: number | null;
+  /** True when the moment was derived from an audio/visual/chat peak rather than the model. */
+  signalDerived?: boolean;
 }
 
 export interface Assumption {
@@ -194,6 +196,7 @@ export function buildMomentPrompt(window: TranscriptWindow, spec: ClipSpec, boun
     '- reveal: a number or fact that reframes everything',
     '- conflict: disagreement or pushback without hostility',
     '- wholesome: a warm or touching beat',
+    '- visual: a strong visual beat or reaction with little or no dialogue',
     '',
     '## Hard rules',
     '- Never select a moment whose content matches forbiddenContent or forbiddenRules.',
@@ -216,7 +219,9 @@ export function buildMomentPrompt(window: TranscriptWindow, spec: ClipSpec, boun
           '',
           '## Audio energy (absolute seconds; higher dB = louder, more emotional)',
           ...energyWindows.map(item => `- ${item.start.toFixed(1)}-${item.end.toFixed(1)}s  mean ${item.meanDb.toFixed(1)} dB`),
-          ...(signals && signals.cutDense.length ? ['', '## Dense visual cuts (fast editing/action)', ...signals.cutDense.slice(0, 8).map(item => `- ${item.start.toFixed(1)}-${item.end.toFixed(1)}s`)] : []),
+          ...(signals?.visualPeaks?.length ? ['', '## High visual activity (reactions, movement; may have little dialogue)', ...signals.visualPeaks.slice(0, 8).map(item => `- ${item.start.toFixed(1)}-${item.end.toFixed(1)}s`)] : []),
+          ...(signals?.chatSpikes?.length ? ['', '## Chat floods (viewers reacted strongly here)', ...signals.chatSpikes.slice(0, 8).map(item => `- ${item.start.toFixed(1)}-${item.end.toFixed(1)}s`)] : []),
+          ...(signals?.cutDense?.length ? ['', '## Dense visual cuts (fast editing/action)', ...signals.cutDense.slice(0, 8).map(item => `- ${item.start.toFixed(1)}-${item.end.toFixed(1)}s`)] : []),
         ]
       : []),
     '',
@@ -432,7 +437,7 @@ export function applyHookGate(candidates: MomentCandidate[], transcript: Transcr
       continue;
     }
     const openingWords = words.filter(word => word.start >= candidate.start - 1e-6 && word.start < candidate.start + windowSeconds).length;
-    if (openingWords < minWords) {
+    if (openingWords < minWords && !candidate.signalDerived) {
       dropped.push(candidate);
       warnings.push(`Hook gate dropped ${candidate.start.toFixed(1)}-${candidate.end.toFixed(1)}s: only ${openingWords} word(s) in the first ${windowSeconds}s.`);
       continue;
@@ -442,7 +447,7 @@ export function applyHookGate(candidates: MomentCandidate[], transcript: Transcr
   return { candidates: kept, dropped, warnings };
 }
 
-/** Composite 0..1 virality score: the rubric, blended with audio energy when signals exist. */
+/** Composite 0..1 virality score: the rubric, blended with audio/visual/chat signals when available. */
 export function scoreCandidate(candidate: MomentCandidate, signals?: MediaSignals): number {
   const rubric =
     clamp(candidate.hookRating / 10, 0, 1) * 0.4 +
@@ -452,10 +457,12 @@ export function scoreCandidate(candidate: MomentCandidate, signals?: MediaSignal
     ((candidate.payoff ?? 3) / 5) * 0.1;
   if (!signals || !signals.loudness.length) return clamp(rubric, 0, 1);
   const energy = candidate.audioEnergyDb ?? energyAt(signals, candidate.start, candidate.end);
-  if (energy === null || energy === undefined) return clamp(rubric, 0, 1);
   const ceiling = signals.medianLoudness + Math.max(3, signals.dynamicRangeDb);
-  const energyScore = clamp((energy - signals.medianLoudness) / Math.max(1, ceiling - signals.medianLoudness), 0, 1);
-  return clamp(rubric * 0.7 + energyScore * 0.3, 0, 1);
+  const energyScore = energy === null || energy === undefined ? 0 : clamp((energy - signals.medianLoudness) / Math.max(1, ceiling - signals.medianLoudness), 0, 1);
+  const overlaps = (ranges: TimeRange[] | undefined): boolean => (ranges ?? []).some(range => candidate.start <= range.end && candidate.end >= range.start);
+  const visual = overlaps(signals.visualPeaks) ? 1 : 0;
+  const chat = overlaps(signals.chatSpikes) ? 1 : 0;
+  return clamp(rubric * 0.6 + energyScore * 0.25 + visual * 0.075 + chat * 0.075, 0, 1);
 }
 
 /** Attach the moment's audio energy and the composite virality score. */
@@ -496,6 +503,45 @@ export function applyPayoffGate(candidates: MomentCandidate[]): PayoffGateResult
     kept.push(candidate);
   }
   return { candidates: kept, dropped, warnings };
+}
+
+/**
+ * Windows built directly from audio/visual/chat peaks, so moments that are
+ * visual or reaction-driven (little or no dialogue) can be selected too.
+ */
+export function signalCandidates(signals: MediaSignals, durationSeconds: number, bounds: DurationBounds, existing: MomentCandidate[] = []): MomentCandidate[] {
+  const peaks = allPeaks(signals);
+  if (!peaks.length || !(durationSeconds > 0)) return [];
+  const hasVisual = (range: TimeRange): boolean => signals.visualPeaks.some(peak => range.start <= peak.end && range.end >= peak.start);
+  const hasChat = (range: TimeRange): boolean => signals.chatSpikes.some(peak => range.start <= peak.end && range.end >= peak.start);
+  const out: MomentCandidate[] = [];
+  for (const peak of peaks) {
+    const length = Math.min(bounds.maxSeconds, Math.max(bounds.minSeconds, peak.end - peak.start + 8));
+    const start = clamp(peak.start - 3, 0, Math.max(0, durationSeconds - length));
+    const end = Math.min(durationSeconds, start + length);
+    if (!(end > start)) continue;
+    const candidate: MomentCandidate = { start, end, reason: '', hookRating: 0, rulesChecked: [] };
+    const clash = existing.some(other => timeIoU(other, candidate) > 0.5) || out.some(other => timeIoU(other, candidate) > 0.5);
+    if (clash) continue;
+    const energy = energyAt(signals, start, end);
+    const chat = hasChat(peak);
+    const visual = hasVisual(peak);
+    const type = chat ? 'reaction' : visual ? 'visual' : 'reaction';
+    out.push({
+      start,
+      end,
+      momentType: type,
+      reason: `Signal peak${visual ? ' with high visual activity' : ''}${chat ? ' and a chat flood' : ''}; little dialogue may be present.`,
+      hookRating: energy !== null && energy > signals.medianLoudness ? 6 : 5,
+      rulesChecked: [],
+      signalDerived: true,
+    });
+  }
+  return out
+    .map(candidate => ({ candidate, energy: energyAt(signals, candidate.start, candidate.end) ?? signals.medianLoudness }))
+    .sort((a, b) => b.energy - a.energy)
+    .slice(0, 12)
+    .map(entry => entry.candidate);
 }
 
 export interface HookRefineOptions {
@@ -635,7 +681,10 @@ export async function selectMoments(llm: TextLlm, transcript: Transcript, spec: 
     warnings.push(...parsed.warnings.map(warning => `window ${window.index + 1}: ${warning}`));
   }
   const textOf = (candidate: MomentCandidate): string => transcriptExcerpt(transcript, candidate.start, candidate.end).text;
-  const payoffGate = options.payoffGate === false ? { candidates, dropped: [], warnings: [] } : applyPayoffGate(candidates);
+  const signalDerived = options.signals ? signalCandidates(options.signals, durationSeconds, bounds, candidates) : [];
+  if (signalDerived.length) warnings.push(`Added ${signalDerived.length} candidate(s) from audio/visual/chat peaks.`);
+  const pool = [...candidates, ...signalDerived];
+  const payoffGate = options.payoffGate === false ? { candidates: pool, dropped: [], warnings: [] } : applyPayoffGate(pool);
   warnings.push(...payoffGate.warnings);
   const deduped = dedupeCandidates(payoffGate.candidates, textOf, options.dedupe);
   if (deduped.length !== payoffGate.candidates.length) warnings.push(`Similarity dedup removed ${payoffGate.candidates.length - deduped.length} overlapping or near-duplicate candidate(s).`);

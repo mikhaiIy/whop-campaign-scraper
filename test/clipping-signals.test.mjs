@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import {
   parseEbur128, parseSceneChanges, loudnessPeaks, cutDensity, summarize,
   energyAt, peakTimeWithin, sourcePotential, topEnergyWindows, EMPTY_SIGNALS,
+  parseMotion, motionPeaks, mergeSignals, allPeaks,
 } from '../dist/clipping/signals.js';
+import { parseLiveChat, relativeChatTimes, chatVelocity } from '../dist/clipping/chat.js';
 import {
-  scoreCandidate, annotateSignals, applyPayoffGate, refineHookStart, buildMomentPrompt, planWindows,
+  scoreCandidate, annotateSignals, applyPayoffGate, refineHookStart, buildMomentPrompt, planWindows, signalCandidates,
 } from '../dist/clipping/moments.js';
 import { clippabilityScore, rankFootage } from '../dist/clipping/youtube.js';
-import { buildCaptionCards } from '../dist/clipping/render.js';
+import { buildCaptionCards, buildAss, buildRenderArgs, resolveColdOpenOptions } from '../dist/clipping/render.js';
 
 const signalLine = (t, m) => `[Parsed_ebur128_0 @ 0x1] t: ${t} TARGET:-23 LUFS    M:${m} S:${m}     I: -70.0 LUFS       LRA:   0.0 LU`;
 
@@ -127,4 +129,81 @@ test('buildCaptionCards merges cards that would flash by too fast', () => {
   const paced = buildCaptionCards(words, { maxWordsPerCard: 3, maxGapSeconds: 0.7, minDurationSeconds: 0.4 });
   assert.ok(paced.every(card => card.end - card.start >= 0.4 || card.words.length >= 3));
   assert.ok(paced.length <= plain.length);
+});
+
+test('parseLiveChat and chatVelocity find the chat flood', () => {
+  const times = [];
+  for (let i = 0; i < 30; i++) times.push(i * 0.1);
+  for (let t = 10; t < 60; t += 2) times.push(t);
+  const lines = times.map(seconds => JSON.stringify({ replayChatItemAction: { actions: [{ addChatItemAction: { item: { liveChatTextMessageRenderer: { timestampUsec: String((1_700_000_000 + seconds) * 1_000_000) } } } }] } }));
+  const parsed = relativeChatTimes(parseLiveChat(lines.join('\n')));
+  assert.equal(parsed.length, times.length);
+  assert.equal(parsed[0], 0);
+  const spikes = chatVelocity(parsed, { windowSeconds: 5, minMessages: 5, zThreshold: 1.5 });
+  assert.ok(spikes.length >= 1);
+  assert.ok(spikes.some(range => range.start <= 1 && range.end >= 3));
+});
+
+test('parseMotion and motionPeaks read frame-difference energy', () => {
+  const text = ['frame:0 pts:0 pts_time:0.000', 'lavfi.signalstats.YAVG=1.0', 'frame:1 pts:1 pts_time:0.250', 'lavfi.signalstats.YAVG=1.1', 'frame:2 pts:2 pts_time:0.500', 'lavfi.signalstats.YAVG=40.0'].join('\n');
+  assert.deepEqual(parseMotion(text), [{ t: 0, motion: 1 }, { t: 0.25, motion: 1.1 }, { t: 0.5, motion: 40 }]);
+  const samples = [];
+  for (let i = 0; i < 60; i++) samples.push({ t: i * 0.25, motion: i > 10 && i < 20 ? 40 : 1 });
+  const peaks = motionPeaks(samples);
+  assert.equal(peaks.length, 1);
+  assert.ok(peaks[0].start <= 2.75 && peaks[0].end >= 4.5);
+});
+
+test('mergeSignals and allPeaks combine audio, visual and chat', () => {
+  const audio = signalsFrom([[0, -22], [10, -10], [20, -22]]);
+  const video = { ...EMPTY_SIGNALS, durationSeconds: 20, visualPeaks: [{ start: 5, end: 7 }] };
+  const merged = mergeSignals(audio, video, [{ start: 12, end: 14 }]);
+  assert.equal(merged.visualPeaks.length, 1);
+  assert.equal(merged.chatSpikes.length, 1);
+  const peaks = allPeaks(merged);
+  assert.ok(peaks.some(range => range.start === 5));
+  assert.ok(peaks.some(range => range.start === 12));
+});
+
+test('signalCandidates turns visual/chat peaks into selectable moments', () => {
+  const signals = { ...signalsFrom([[0, -20], [100, -10], [200, -20]]), durationSeconds: 300, visualPeaks: [{ start: 150, end: 158 }], chatSpikes: [{ start: 250, end: 255 }] };
+  const bounds = { minSeconds: 20, maxSeconds: 60, assumptions: [] };
+  const derived = signalCandidates(signals, 300, bounds, []);
+  assert.ok(derived.length >= 2);
+  assert.ok(derived.some(candidate => candidate.momentType === 'visual'));
+  assert.ok(derived.every(candidate => candidate.end - candidate.start >= 20));
+  const overlapping = signalCandidates(signals, 300, bounds, [{ start: 145, end: 165, reason: 'x', hookRating: 8, rulesChecked: [] }]);
+  assert.ok(overlapping.every(candidate => !(candidate.start < 165 && candidate.end > 145)));
+});
+
+test('resolveColdOpenOptions clamps and can be disabled', () => {
+  assert.equal(resolveColdOpenOptions({ enabled: true, startSeconds: 10, durationSeconds: 0.8 }, 20).startSeconds, 10);
+  assert.equal(resolveColdOpenOptions({ enabled: true, startSeconds: 100, durationSeconds: 0.8 }, 20).startSeconds, 19.2);
+  assert.equal(resolveColdOpenOptions({}, 20).enabled, false);
+  assert.equal(resolveColdOpenOptions({ enabled: true, durationSeconds: 0.8 }, 0.5).enabled, false);
+});
+
+test('buildRenderArgs emits a filter_complex concat for a cold open', () => {
+  const args = buildRenderArgs({
+    inputPath: '/in.mp4', outputPath: '/out.mp4', assPath: '/subs.ass',
+    reframeFilter: 'scale=3414:1920,crop=1080:1920:1168:0',
+    coldOpen: { startSeconds: 10, durationSeconds: 0.8 },
+    loudness: { enabled: true, targetI: -14, targetTP: -1.5, targetLRA: 11, linear: true },
+  });
+  const joined = args.join(' ');
+  assert.ok(joined.includes('-filter_complex'));
+  assert.ok(joined.includes('trim=start=10:duration=0.8'));
+  assert.ok(joined.includes('concat=n=2:v=1:a=0'));
+  assert.ok(joined.includes('[vcat]subtitles=filename='));
+  assert.ok(joined.includes('-map [vout]'));
+  assert.ok(joined.includes('concat=n=2:v=0:a=1'));
+});
+
+test('buildAss shifts caption times for a cold-open teaser', () => {
+  const transcript = { videoId: 'v', model: 'm', device: 'c', computeType: 'x', language: 'en', durationSeconds: 2, offsetSeconds: 0, segments: [{ start: 0, end: 2, text: 'hi there', words: [
+    { start: 0, end: 0.5, word: 'hi', probability: 1 },
+    { start: 0.5, end: 1, word: 'there', probability: 1 },
+  ] }] };
+  const { ass } = buildAss(transcript, 0, 2, { maxWordsPerCard: 2 }, 1.5);
+  assert.match(ass, /Dialogue: 0,0:00:01\.50,/);
 });

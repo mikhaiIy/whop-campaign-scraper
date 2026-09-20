@@ -31,8 +31,10 @@ const cutRunner = (state) => async (command, args) => {
   state.calls.push({ command, args });
   if (command === 'ffmpeg') {
     const output = args[args.length - 1];
-    state.durations.set(output, Number(args[args.indexOf('-t') + 1]));
-    await writeFile(output, 'fake-mp4');
+    if (output !== '-') {
+      state.durations.set(output, Number(args[args.indexOf('-t') + 1]));
+      await writeFile(output, 'fake-mp4');
+    }
     return { stdout: '', stderr: '', code: 0, timedOut: false };
   }
   const path = args[args.length - 1];
@@ -236,7 +238,7 @@ test('cut refuses to report success when the output duration is wrong', async ()
   const runner = async (command, args) => {
     state.calls.push({ command, args });
     if (command === 'ffmpeg') {
-      await writeFile(args[args.length - 1], 'fake-mp4');
+      if (args[args.length - 1] !== '-') await writeFile(args[args.length - 1], 'fake-mp4');
       return { stdout: '', stderr: '', code: 0, timedOut: false };
     }
     return { stdout: JSON.stringify({ format: { duration: '3.0' }, streams: [{ codec_type: 'video', codec_name: 'h264' }] }), stderr: '', code: 0, timedOut: false };

@@ -17,12 +17,22 @@ export interface LoudnessSample {
   m: number;
 }
 
+export interface MotionSample {
+  t: number;
+  motion: number;
+}
+
 export interface MediaSignals {
   durationSeconds: number;
   loudness: LoudnessSample[];
   loudPeaks: TimeRange[];
   sceneCuts: number[];
   cutDense: TimeRange[];
+  /** Frame-difference energy (visual activity), when a video source was probed. */
+  motion: MotionSample[];
+  visualPeaks: TimeRange[];
+  /** Chat-velocity spikes, when a live-chat replay was available. */
+  chatSpikes: TimeRange[];
   medianLoudness: number;
   dynamicRangeDb: number;
 }
@@ -52,6 +62,9 @@ export const EMPTY_SIGNALS: MediaSignals = {
   loudPeaks: [],
   sceneCuts: [],
   cutDense: [],
+  motion: [],
+  visualPeaks: [],
+  chatSpikes: [],
   medianLoudness: -70,
   dynamicRangeDb: 0,
 };
@@ -79,6 +92,47 @@ export function parseSceneChanges(stderr: string): number[] {
     if (Number.isFinite(t)) times.push(t);
   }
   return [...new Set(times)].sort((a, b) => a - b);
+}
+
+/** Parse `metadata=print:key=lavfi.signalstats.YAVG` output (frame-difference energy). */
+export function parseMotion(text: string): MotionSample[] {
+  const samples: MotionSample[] = [];
+  let pendingTime: number | null = null;
+  for (const line of text.split('\n')) {
+    const timeMatch = line.match(/pts_time:\s*([\d.]+)/);
+    if (timeMatch) { pendingTime = Number(timeMatch[1]); continue; }
+    const valueMatch = line.match(/YAVG=([\d.]+)/);
+    if (valueMatch && pendingTime !== null) {
+      samples.push({ t: pendingTime, motion: Number(valueMatch[1]) });
+      pendingTime = null;
+    }
+  }
+  return samples;
+}
+
+/** Visual-activity peaks: frame-difference energy well above the clip's own baseline. */
+export function motionPeaks(samples: MotionSample[], options: PeakOptions = {}): TimeRange[] {
+  const minDurSec = options.minDurSec ?? 1;
+  const mergeGapSec = options.mergeGapSec ?? 2;
+  if (samples.length < 10) return [];
+  const values = samples.map(sample => sample.motion).sort((a, b) => a - b);
+  const median = values[Math.floor(values.length / 2)];
+  const max = values[values.length - 1];
+  if (max - median < 0.5) return [];
+  const threshold = median + 0.4 * (max - median);
+  const ranges: TimeRange[] = [];
+  let current: TimeRange | null = null;
+  for (const sample of samples) {
+    if (sample.motion >= threshold) {
+      if (current && sample.t - current.end <= mergeGapSec) current.end = sample.t;
+      else {
+        if (current) ranges.push(current);
+        current = { start: sample.t, end: sample.t };
+      }
+    }
+  }
+  if (current) ranges.push(current);
+  return ranges.filter(range => range.end - range.start >= minDurSec);
 }
 
 /** Sustained loudness bursts above the programme median. */
@@ -165,20 +219,22 @@ export interface SourcePotential {
 export function sourcePotential(signals: MediaSignals): SourcePotential {
   const range = signals.dynamicRangeDb;
   const peaks = signals.loudPeaks;
-  if (range >= 10 && peaks.length >= 2) {
-    return { level: 'high', dynamicRangeDb: range, peakSeconds: peaks, reason: `dynamic range ${range.toFixed(1)} dB with ${peaks.length} loud window(s)` };
+  const extra = (signals.visualPeaks?.length ?? 0) + (signals.chatSpikes?.length ?? 0);
+  if ((range >= 10 && peaks.length >= 2) || extra >= 6) {
+    return { level: 'high', dynamicRangeDb: range, peakSeconds: peaks, reason: `dynamic range ${range.toFixed(1)} dB, ${peaks.length} loud and ${extra} visual/chat window(s)` };
   }
-  if (range >= 6 || peaks.length >= 1) {
-    return { level: 'medium', dynamicRangeDb: range, peakSeconds: peaks, reason: `dynamic range ${range.toFixed(1)} dB with ${peaks.length} loud window(s)` };
+  if (range >= 6 || peaks.length >= 1 || extra >= 2) {
+    return { level: 'medium', dynamicRangeDb: range, peakSeconds: peaks, reason: `dynamic range ${range.toFixed(1)} dB, ${peaks.length} loud and ${extra} visual/chat window(s)` };
   }
-  return { level: 'low', dynamicRangeDb: range, peakSeconds: peaks, reason: `flat mix: dynamic range only ${range.toFixed(1)} dB and no loud windows` };
+  return { level: 'low', dynamicRangeDb: range, peakSeconds: peaks, reason: `flat mix: dynamic range only ${range.toFixed(1)} dB and no loud, visual or chat windows` };
 }
 
 /**
- * Collect loudness and scene signals. Fail-open: any probe error yields empty
- * signals so detection never dies because a source has no audio/video stream.
+ * Collect loudness (and, for video inputs, scene + motion) signals. Fail-open:
+ * any probe error yields empty signals so detection never dies because a source
+ * has no audio/video stream.
  */
-export async function collectSignals(inputPath: string, deps: SignalDeps = {}): Promise<MediaSignals> {
+export async function collectSignals(inputPath: string, deps: SignalDeps = {}, options: { motion?: boolean } = {}): Promise<MediaSignals> {
   const runner = deps.runner ?? defaultProcessRunner;
   const ffmpeg = deps.ffmpegCommand ?? 'ffmpeg';
   const timeoutMs = deps.timeoutMs ?? 600_000;
@@ -190,12 +246,17 @@ export async function collectSignals(inputPath: string, deps: SignalDeps = {}): 
       return '';
     }
   };
-  const [loudErr, sceneErr] = await Promise.all([
+  const probes: Array<Promise<string>> = [
     run(['-hide_banner', '-nostdin', '-i', inputPath, '-vn', '-af', 'ebur128', '-f', 'null', '-']),
     run(['-hide_banner', '-nostdin', '-i', inputPath, '-an', '-vf', "fps=4,scale=160:-2,select='gt(scene,0.3)',showinfo", '-f', 'null', '-']),
-  ]);
+  ];
+  if (options.motion) {
+    probes.push(run(['-hide_banner', '-nostdin', '-i', inputPath, '-an', '-vf', 'fps=4,scale=160:-2,tblend=all_mode=difference,signalstats,metadata=print:key=lavfi.signalstats.YAVG', '-f', 'null', '-']));
+  }
+  const [loudErr, sceneErr, motionErr] = await Promise.all(probes);
   const loudness = parseEbur128(loudErr);
   const sceneCuts = parseSceneChanges(sceneErr);
+  const motion = options.motion ? parseMotion(motionErr ?? '') : [];
   const { medianLoudness, dynamicRangeDb } = summarize(loudness);
   const durationSeconds = loudness.length ? loudness[loudness.length - 1].t : (sceneCuts.length ? sceneCuts[sceneCuts.length - 1] : 0);
   return {
@@ -204,9 +265,38 @@ export async function collectSignals(inputPath: string, deps: SignalDeps = {}): 
     loudPeaks: loudnessPeaks(loudness),
     sceneCuts,
     cutDense: cutDensity(sceneCuts),
+    motion,
+    visualPeaks: motionPeaks(motion),
+    chatSpikes: [],
     medianLoudness,
     dynamicRangeDb,
   };
+}
+
+/** Combine loudness (from audio) with visual and chat signals (from video/chat). */
+export function mergeSignals(audio: MediaSignals, video?: MediaSignals | null, chatSpikes: TimeRange[] = []): MediaSignals {
+  if (!video && !chatSpikes.length) return audio;
+  return {
+    ...audio,
+    sceneCuts: video?.sceneCuts ?? audio.sceneCuts,
+    cutDense: video?.cutDense ?? audio.cutDense,
+    motion: video?.motion ?? audio.motion,
+    visualPeaks: video?.visualPeaks ?? audio.visualPeaks,
+    chatSpikes,
+    durationSeconds: Math.max(audio.durationSeconds, video?.durationSeconds ?? 0),
+  };
+}
+
+/** All peak windows (loud + visual + chat) for candidate generation. */
+export function allPeaks(signals: MediaSignals): TimeRange[] {
+  const ranges = [...signals.loudPeaks, ...signals.visualPeaks, ...signals.chatSpikes].sort((a, b) => a.start - b.start);
+  const merged: TimeRange[] = [];
+  for (const range of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && range.start <= last.end + 1) last.end = Math.max(last.end, range.end);
+    else merged.push({ ...range });
+  }
+  return merged;
 }
 
 /** Top energy windows, used to anchor the model to real peaks instead of prose. */

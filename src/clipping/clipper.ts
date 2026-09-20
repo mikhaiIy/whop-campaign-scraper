@@ -8,7 +8,8 @@ import {
   selectMoments, snapCandidate, specProvenanceFor, transcriptExcerpt, refineHookStart,
   type Assumption, type MomentCandidate, type MomentSelection, type MomentSelectionOptions, type SnapOptions, type SnapResult,
 } from './moments.js';
-import { collectSignals, sourcePotential, type MediaSignals, type SourcePotential } from './signals.js';
+import { collectSignals, mergeSignals, sourcePotential, type MediaSignals, type SourcePotential } from './signals.js';
+import { collectChatSignals } from './chat.js';
 import { renderClip, renderOutputPaths, type CaptionOptions, type LoudnessOptions, type RenderResult, type TightenOptions } from './render.js';
 import { TranscriptionCache, flattenWords, shiftTranscript, transcriptDuration, type Transcript } from './transcribe.js';
 import type { ProcessRunner } from './youtube.js';
@@ -24,6 +25,10 @@ export interface PrepareOptions extends MomentSelectionOptions {
   refreshAudio?: boolean;
   refreshTranscript?: boolean;
   snap?: SnapOptions;
+  /** Download a low-res proxy to derive visual (scene/motion) signals. Default true. */
+  visualSignals?: boolean;
+  /** Try to download a live-chat replay for chat-velocity signals. Default true. */
+  chatSignals?: boolean;
 }
 
 export interface PreparedMoments {
@@ -126,7 +131,27 @@ export class ClipAssembler {
     const audio = await this.media.ingestAudio(video, { section: options.audioSection, refresh: options.refreshAudio });
     const raw = await this.transcriber.transcribe(audio, { refresh: options.refreshTranscript, model: options.transcriptModel });
     const transcript = shiftTranscript(raw, audio.section?.start ?? 0);
-    const signals = await collectSignals(audio.path, { runner: this.runner, ffmpegCommand: this.ffmpegCommand });
+    const warnings: string[] = [];
+
+    const audioSignals = await collectSignals(audio.path, { runner: this.runner, ffmpegCommand: this.ffmpegCommand });
+    let signals = audioSignals;
+    if (options.visualSignals !== false && !options.audioSection) {
+      try {
+        const proxy = await this.media.ingestProxy(video, { refresh: options.refreshAudio });
+        const videoSignals = await collectSignals(proxy.path, { runner: this.runner, ffmpegCommand: this.ffmpegCommand }, { motion: true });
+        signals = mergeSignals(audioSignals, videoSignals);
+      } catch (error) {
+        warnings.push(`Visual signals unavailable (${error instanceof Error ? error.message : String(error)}); using audio only.`);
+      }
+    }
+    if (options.chatSignals !== false) {
+      const chatSpikes = await collectChatSignals(sourceUrl, { runner: this.runner });
+      if (chatSpikes.length) {
+        signals = mergeSignals(signals, null, chatSpikes);
+        warnings.push(`Chat velocity found ${chatSpikes.length} spike window(s).`);
+      }
+    }
+
     const selection = await selectMoments(this.llm, transcript, spec, { ...options, signals });
     const candidates = selection.candidates.map(candidate => {
       const snap = snapCandidate(candidate, transcript, options.snap);
@@ -134,9 +159,9 @@ export class ClipAssembler {
       const refinedSnap = hookRefine.moved ? snapCandidate({ start: hookRefine.start, end: snap.end }, transcript, options.snap) : snap;
       return { candidate, snap: refinedSnap, hookRefine };
     });
-    const warnings = [...selection.warnings];
+    warnings.push(...selection.warnings);
     const potential = sourcePotential(signals);
-    if (potential.level === 'low') warnings.push(`Source audio looks flat (${potential.reason}); clips from it are unlikely to feel energetic.`);
+    if (potential.level === 'low') warnings.push(`Source looks flat (${potential.reason}); clips from it are unlikely to feel energetic.`);
     for (const item of candidates) {
       warnings.push(...item.snap.warnings.map(warning => `candidate ${item.candidate.start.toFixed(1)}s: ${warning}`));
       if (item.hookRefine.moved) warnings.push(`candidate ${item.candidate.start.toFixed(1)}s: ${item.hookRefine.reason}.`);
@@ -212,6 +237,9 @@ export class ClipAssembler {
               captions: options.captions,
               loudness: options.loudness,
               tighten: options.tighten,
+              coldOpen: item.candidate.signalPeakSeconds !== null && item.candidate.signalPeakSeconds !== undefined
+                ? { enabled: true, startSeconds: Math.max(0, item.candidate.signalPeakSeconds - item.snap.start), durationSeconds: 0.8 }
+                : undefined,
             }, { runner: this.runner, ffmpegCommand: this.ffmpegCommand, probeCommand: this.probeCommand, durationToleranceSeconds: this.durationToleranceSeconds, refresh: options.refreshCuts, now: this.now });
             warnings.push(...render.stages.captions.warnings.map(warning => `render ${base}: ${warning}`));
             if (render.stages.tighten.warning) warnings.push(`render ${base}: ${render.stages.tighten.warning}`);
