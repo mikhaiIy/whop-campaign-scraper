@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import {
   buildReframeFilter, buildRenderArgs, planPacing, renderClip, renderOutputPaths, resolvePacingOptions,
 } from '../dist/clipping/render.js';
+import { EMPTY_SIGNALS, beatTimes, loudnessOnsets } from '../dist/clipping/signals.js';
 
 const wordsWithStops = (count = 40, step = 0.5, every = 8) => {
   const words = [];
@@ -57,6 +58,47 @@ test('planPacing forces a cut at the ceiling when no boundary exists', () => {
 test('planPacing stays off for short clips and when disabled', () => {
   assert.deepEqual(planPacing(flatWords(), 0, 2, { enabled: true }), []);
   assert.deepEqual(planPacing(flatWords(), 0, 20, { enabled: false }), []);
+});
+
+test('planPacing falls back to energy beats when the transcript has no boundary', () => {
+  const plan = planPacing(flatWords(), 0, 10, { enabled: true, beats: [2.0, 5.2, 99] });
+  assert.equal(plan.length, 2);
+  assert.equal(plan[0].duration, 5.2);
+  assert.equal(plan[1].source, 'beat');
+  assert.equal(plan[1].start, 5.2);
+});
+
+test('planPacing prefers a sentence boundary over a nearby beat', () => {
+  const plan = planPacing(wordsWithStops().segments[0].words, 0, 20, { enabled: true, beats: [4.3] });
+  assert.equal(plan[0].source, 'start');
+  assert.equal(plan[1].source, 'sentence');
+  assert.equal(plan[1].start, 4);
+});
+
+test('loudnessOnsets finds spaced emphasis spikes above the median', () => {
+  const samples = [
+    { t: 0, m: -30 }, { t: 0.5, m: -30 }, { t: 1, m: -30 },
+    { t: 1.5, m: -20 }, { t: 2, m: -22 }, { t: 2.5, m: -30 },
+    { t: 3, m: -30 }, { t: 3.5, m: -18 }, { t: 4, m: -25 }, { t: 4.5, m: -30 },
+  ];
+  assert.deepEqual(loudnessOnsets(samples, { riseDb: 3, minGapSec: 1 }), [1.5, 3.5]);
+  assert.deepEqual(loudnessOnsets(samples, { riseDb: 3, minGapSec: 3 }), [1.5]);
+  assert.deepEqual(loudnessOnsets([], {}), []);
+});
+
+test('beatTimes collects loudness onsets, peak starts and scene cuts', () => {
+  const signals = {
+    ...EMPTY_SIGNALS,
+    loudness: [{ t: 0, m: -30 }, { t: 0.5, m: -30 }, { t: 1, m: -18 }, { t: 1.5, m: -30 }, { t: 2, m: -30 }],
+    loudPeaks: [{ start: 3, end: 4 }],
+    visualPeaks: [{ start: 7, end: 8 }],
+    emotionPeaks: [{ start: 12, end: 13 }],
+    chatSpikes: [{ start: 20, end: 21 }],
+    sceneCuts: [5, 25],
+  };
+  assert.deepEqual(beatTimes(signals, 0, 15), [1, 3, 5, 7, 12]);
+  assert.deepEqual(beatTimes(signals, 6, 15), [7, 12]);
+  assert.deepEqual(beatTimes(signals, 30, 40), []);
 });
 
 test('buildReframeFilter punches in when zoom is above one', () => {

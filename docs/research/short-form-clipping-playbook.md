@@ -34,11 +34,13 @@ captions: {
 
 ## Cut-point selection
 
-1. Candidate boundaries are the first word after a sentence-ending punctuation
-   mark or a pause longer than `sentencePauseSeconds`.
-2. Walking from the clip start, each shot is cut at the candidate nearest the
-   midpoint of `[min, max]`; when no candidate falls in the window, the cut is
-   forced at `maxSecondsBetweenCuts`.
+1. Candidate boundaries are, in priority order: the first word after a
+   sentence-ending punctuation mark or a pause longer than
+   `sentencePauseSeconds`, then an audio/visual emphasis beat
+   (`beatTimes`: loudness onsets, peak starts, scene cuts).
+2. Walking from the clip start, each shot is cut at the highest-priority
+   candidate nearest the midpoint of `[min, max]`; when no candidate falls in
+   the window, the cut is forced at `maxSecondsBetweenCuts`.
 3. Shots alternate full frame / punch-in, so consecutive cuts change the framing
    rather than only the zoom level.
 4. The last shot absorbs the remainder; total shot duration equals the clip
@@ -47,6 +49,5 @@ captions: {
 ## Open items
 
 - Sound design: whoosh/impact on beats, optional music bed (needs license).
-- Beat detection from audio energy (currently cut points come from the
-  transcript only).
 - Per-clip pacing intensity keyed to the source's hype-potential grade.
+- Drift/dolly moves inside a shot instead of hard punch-ins.

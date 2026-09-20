@@ -182,6 +182,30 @@ export function loudnessPeaks(samples: LoudnessSample[], options: PeakOptions = 
   return ranges.filter(range => range.end - range.start >= minDurSec);
 }
 
+/**
+ * Energy onsets: local loudness maxima well above the programme median,
+ * spaced at least `minGapSec` apart. Unlike `loudnessPeaks`, this fires on a
+ * brief emphasis spike, which is what a punch-in should land on.
+ */
+export function loudnessOnsets(samples: LoudnessSample[], options: { riseDb?: number; minGapSec?: number } = {}): number[] {
+  const riseDb = options.riseDb ?? 3;
+  const minGapSec = options.minGapSec ?? 1.5;
+  const usable = samples.filter(sample => sample.m > SILENCE_FLOOR_DB).sort((a, b) => a.t - b.t);
+  if (usable.length < 5) return [];
+  const sorted = usable.map(sample => sample.m).sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const threshold = median + riseDb;
+  const onsets: number[] = [];
+  for (let index = 1; index < usable.length - 1; index++) {
+    const current = usable[index];
+    if (current.m < threshold) continue;
+    if (current.m < usable[index - 1].m || current.m <= usable[index + 1].m) continue;
+    if (onsets.length && current.t - onsets[onsets.length - 1] < minGapSec) continue;
+    onsets.push(current.t);
+  }
+  return onsets;
+}
+
 /** Windows with dense scene cuts (fast visual pace). */
 export function cutDensity(times: number[], options: DensityOptions = {}): TimeRange[] {
   const windowSeconds = options.windowSeconds ?? 6;
@@ -400,6 +424,21 @@ export function allPeaks(signals: MediaSignals): TimeRange[] {
     else merged.push({ ...range });
   }
   return merged;
+}
+
+/**
+ * Candidate cut points from real emphasis inside [start, end]: the onset of
+ * every loudness, visual, emotion and chat peak, plus source scene cuts. Used
+ * by the render pacing pass to land a punch-in on a beat when the transcript
+ * offers no sentence boundary.
+ */
+export function beatTimes(signals: MediaSignals, start: number, end: number): number[] {
+  const times: number[] = [...loudnessOnsets(signals.loudness)];
+  for (const range of [...signals.loudPeaks, ...(signals.visualPeaks ?? []), ...(signals.emotionPeaks ?? []), ...(signals.chatSpikes ?? [])]) {
+    times.push(range.start);
+  }
+  for (const cut of signals.sceneCuts ?? []) times.push(cut);
+  return [...new Set(times.filter(time => Number.isFinite(time) && time >= start && time <= end))].sort((a, b) => a - b);
 }
 
 /** Top energy windows, used to anchor the model to real peaks instead of prose. */

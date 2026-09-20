@@ -8,7 +8,7 @@ import {
   selectMoments, snapCandidate, specProvenanceFor, transcriptExcerpt, refineHookStart,
   type Assumption, type MomentCandidate, type MomentSelection, type MomentSelectionOptions, type SnapOptions, type SnapResult,
 } from './moments.js';
-import { collectEmotionSignals, collectSignals, mergeSignals, sourcePotential, type MediaSignals, type SourcePotential } from './signals.js';
+import { beatTimes, collectEmotionSignals, collectSignals, mergeSignals, sourcePotential, type MediaSignals, type SourcePotential } from './signals.js';
 import { collectChatSignals } from './chat.js';
 import { renderClip, renderOutputPaths, type CaptionOptions, type LoudnessOptions, type PacingOptions, type RenderResult, type TightenOptions } from './render.js';
 import { TranscriptionCache, flattenWords, shiftTranscript, transcriptDuration, type Transcript } from './transcribe.js';
@@ -227,6 +227,8 @@ export class ClipAssembler {
         let render: RenderResult | null = null;
         if (options.enhance) {
           const paths = renderOutputPaths(outDir, base);
+          const pacing = options.pacing ?? { enabled: true };
+          const beats = pacing.beats ?? beatTimes(prepared.signals, item.snap.start, item.snap.end);
           try {
             render = await renderClip({
               campaignId: this.campaignId,
@@ -241,7 +243,7 @@ export class ClipAssembler {
               captions: options.captions,
               loudness: options.loudness,
               tighten: options.tighten,
-              pacing: options.pacing ?? { enabled: true },
+              pacing: { ...pacing, beats },
               coldOpen: item.candidate.signalPeakSeconds !== null && item.candidate.signalPeakSeconds !== undefined
                 ? { enabled: true, startSeconds: Math.max(0, item.candidate.signalPeakSeconds - item.snap.start), durationSeconds: 0.8 }
                 : undefined,

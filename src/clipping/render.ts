@@ -121,7 +121,7 @@ export interface RenderStageReport {
   tighten: { ran: boolean; command: string; args: string[]; output: string | null; warning: string | null };
   reframe: { ran: boolean; filter: string | null; focusX: number | null; focusSource: 'request' | 'face' | 'center' };
   coldOpen: { ran: boolean; startSeconds: number; durationSeconds: number };
-  pacing: { ran: boolean; segments: number; cuts: number; plan: PacingSegmentPlan[] };
+  pacing: { ran: boolean; segments: number; cuts: number; beats: number; plan: PacingSegmentPlan[] };
   captions: { ran: boolean; path: string | null; cards: number; warnings: string[] };
   loudness: { ran: boolean; measured: LoudnormMeasurement | null };
 }
@@ -252,6 +252,8 @@ export function resolveColdOpenOptions(options: ColdOpenOptions = {}, clipDurati
   return { enabled, startSeconds, durationSeconds };
 }
 
+export type PacingCutSource = 'start' | 'sentence' | 'pause' | 'beat' | 'forced';
+
 export interface PacingOptions {
   enabled?: boolean;
   /** Preferred maximum time a shot may hold before a visual change. */
@@ -264,6 +266,8 @@ export interface PacingOptions {
   minClipSeconds?: number;
   /** A pause at least this long also marks a shot boundary. */
   sentencePauseSeconds?: number;
+  /** Absolute source-time emphasis points (loudness/visual/emotion peaks, scene cuts). */
+  beats?: number[];
 }
 
 export interface ResolvedPacingOptions {
@@ -273,6 +277,7 @@ export interface ResolvedPacingOptions {
   zoomAmount: number;
   minClipSeconds: number;
   sentencePauseSeconds: number;
+  beats: number[];
 }
 
 export function resolvePacingOptions(options: PacingOptions = {}): ResolvedPacingOptions {
@@ -285,6 +290,7 @@ export function resolvePacingOptions(options: PacingOptions = {}): ResolvedPacin
     zoomAmount: Math.min(0.5, Math.max(0, asNumber(options.zoomAmount, 0.15))),
     minClipSeconds: Math.max(0, asNumber(options.minClipSeconds, 3)),
     sentencePauseSeconds: Math.max(0.1, asNumber(options.sentencePauseSeconds, 0.45)),
+    beats: Array.isArray(options.beats) ? options.beats.filter(beat => typeof beat === 'number' && Number.isFinite(beat)) : [],
   };
 }
 
@@ -294,17 +300,24 @@ export interface PacingSegmentPlan {
   duration: number;
   /** Punch-in factor for this shot; 1 is the full frame. */
   zoom: number;
+  /** Why the shot starts where it does. */
+  source: PacingCutSource;
 }
 
 const SENTENCE_END = /[.!?…]["')\]]*$/;
 
+interface PacingCandidate {
+  time: number;
+  source: PacingCutSource;
+}
+
 /**
  * Place visual changes across a clip so the frame never holds longer than
  * `maxSecondsBetweenCuts`. Boundaries prefer sentence starts and long pauses,
- * falling back to a forced cut at the ceiling. Shots alternate between the
- * full frame and a punch-in, which reads as a cut-equivalent attention reset
- * without breaking continuity. Returns [] when the clip is too short or has no
- * words to anchor a boundary.
+ * then fall back to real emphasis beats (energy peaks, scene cuts), then to a
+ * forced cut at the ceiling. Shots alternate between the full frame and a
+ * punch-in, which reads as a cut-equivalent attention reset without breaking
+ * continuity. Returns [] when the clip is too short or has no anchor at all.
  */
 export function planPacing(words: WordTiming[], clipStart: number, clipEnd: number, options: PacingOptions = {}): PacingSegmentPlan[] {
   const resolved = resolvePacingOptions(options);
@@ -315,33 +328,45 @@ export function planPacing(words: WordTiming[], clipStart: number, clipEnd: numb
     .map(word => ({ start: Math.max(0, word.start - clipStart), end: Math.max(0, word.end - clipStart), word: word.word.trim() }))
     .filter(word => word.word.length > 0 && word.end > word.start)
     .sort((a, b) => a.start - b.start);
-  if (inRange.length < 2) return [];
 
-  const candidates: number[] = [];
+  const semantic: PacingCandidate[] = [];
   for (let index = 1; index < inRange.length; index++) {
     const previous = inRange[index - 1];
     const gap = inRange[index].start - previous.end;
-    if (SENTENCE_END.test(previous.word) || gap > resolved.sentencePauseSeconds) candidates.push(inRange[index].start);
+    if (SENTENCE_END.test(previous.word)) semantic.push({ time: inRange[index].start, source: 'sentence' });
+    else if (gap > resolved.sentencePauseSeconds) semantic.push({ time: inRange[index].start, source: 'pause' });
   }
-  const unique = [...new Set(candidates)].filter(time => time > 0 && time < duration).sort((a, b) => a - b);
+  const beats: PacingCandidate[] = resolved.beats
+    .map(beat => beat - clipStart)
+    .filter(time => time > 0 && time < duration)
+    .map(time => ({ time, source: 'beat' as const }));
 
   const target = (resolved.minSecondsBetweenCuts + resolved.maxSecondsBetweenCuts) / 2;
+  const nearest = (pool: PacingCandidate[], desired: number): PacingCandidate =>
+    pool.reduce((best, candidate) => (Math.abs(candidate.time - desired) < Math.abs(best.time - desired) ? candidate : best), pool[0]);
   const segments: PacingSegmentPlan[] = [];
   let cursor = 0;
   let guard = 0;
   while (duration - cursor > resolved.minSecondsBetweenCuts && guard++ < 200) {
     const min = cursor + resolved.minSecondsBetweenCuts;
     const max = Math.min(cursor + resolved.maxSecondsBetweenCuts, duration);
-    const window = unique.filter(time => time >= min && time <= max);
-    const cut = window.length
-      ? window.reduce((best, time) => (Math.abs(time - (cursor + target)) < Math.abs(best - (cursor + target)) ? time : best), window[0])
-      : max;
-    if (cut - cursor < resolved.minSecondsBetweenCuts) break;
-    segments.push({ start: cursor, duration: cut - cursor, zoom: segments.length % 2 === 1 ? 1 + resolved.zoomAmount : 1 });
-    cursor = cut;
+    const inWindow = (pool: PacingCandidate[]): PacingCandidate[] => pool.filter(candidate => candidate.time >= min && candidate.time <= max);
+    const semanticWindow = inWindow(semantic);
+    const beatWindow = inWindow(beats);
+    const chosen = semanticWindow.length ? nearest(semanticWindow, cursor + target)
+      : beatWindow.length ? nearest(beatWindow, cursor + target)
+        : { time: max, source: 'forced' as const };
+    if (chosen.time - cursor < resolved.minSecondsBetweenCuts) break;
+    segments.push({ start: cursor, duration: chosen.time - cursor, zoom: segments.length % 2 === 1 ? 1 + resolved.zoomAmount : 1, source: chosen.source });
+    cursor = chosen.time;
   }
-  if (cursor < duration - 1e-6) segments.push({ start: cursor, duration: duration - cursor, zoom: segments.length % 2 === 1 ? 1 + resolved.zoomAmount : 1 });
-  return segments.length > 1 ? segments : [];
+  if (cursor < duration - 1e-6) segments.push({ start: cursor, duration: duration - cursor, zoom: segments.length % 2 === 1 ? 1 + resolved.zoomAmount : 1, source: 'forced' });
+  if (segments.length < 2) return [];
+  // A segment's `source` describes the boundary at its start, so shift each
+  // recorded cut onto the shot that follows it; the first shot is the start.
+  const cutSources = segments.map(segment => segment.source);
+  segments.forEach((segment, index) => { segment.source = index === 0 ? 'start' : cutSources[index - 1]; });
+  return segments;
 }
 
 function loudnormFilter(loudness: Required<LoudnessOptions>, measured: LoudnormMeasurement | null | undefined): string {
@@ -697,7 +722,7 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
       if (probe.durationSeconds > 0 && Math.abs(probe.durationSeconds - expectedDuration) <= tolerance) {
         return {
           outputPath: request.outputPath, sidecarPath: request.sidecarPath, assPath: null, probe, fromCache: true,
-          stages: { tighten: { ran: false, command: tighten.command, args: [], output: null, warning: null }, reframe: { ran: false, filter: null, focusX: reframe.focusX, focusSource: reframe.focusX === null ? 'center' : 'request' }, coldOpen: { ran: false, startSeconds: coldOpen.startSeconds, durationSeconds: coldOpen.durationSeconds }, pacing: { ran: false, segments: 0, cuts: 0, plan: [] }, captions: { ran: false, path: null, cards: 0, warnings: [] }, loudness: { ran: false, measured: null } },
+          stages: { tighten: { ran: false, command: tighten.command, args: [], output: null, warning: null }, reframe: { ran: false, filter: null, focusX: reframe.focusX, focusSource: reframe.focusX === null ? 'center' : 'request' }, coldOpen: { ran: false, startSeconds: coldOpen.startSeconds, durationSeconds: coldOpen.durationSeconds }, pacing: { ran: false, segments: 0, cuts: 0, beats: 0, plan: [] }, captions: { ran: false, path: null, cards: 0, warnings: [] }, loudness: { ran: false, measured: null } },
         };
       }
     } catch { /* unreadable; re-render */ }
@@ -707,7 +732,7 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
     tighten: { ran: false, command: tighten.command, args: [], output: null, warning: null },
     reframe: { ran: false, filter: null, focusX: reframe.focusX, focusSource: reframe.focusX === null ? 'center' : 'request' },
     coldOpen: { ran: coldOpen.enabled, startSeconds: coldOpen.startSeconds, durationSeconds: coldOpen.durationSeconds },
-    pacing: { ran: false, segments: 0, cuts: 0, plan: [] },
+    pacing: { ran: false, segments: 0, cuts: 0, beats: 0, plan: [] },
     captions: { ran: false, path: null, cards: 0, warnings: [] },
     loudness: { ran: false, measured: null },
   };
@@ -754,7 +779,7 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
           return { start: segment.start, duration: segment.duration, zoom, filter: buildReframeFilter(inputWidth, inputHeight, { ...reframe, focusX, zoom }) };
         });
       }
-      stageReport.pacing = { ran: pacingSegments !== null, segments: pacingSegments?.length ?? 0, cuts: Math.max(0, (pacingSegments?.length ?? 1) - 1), plan };
+      stageReport.pacing = { ran: pacingSegments !== null, segments: pacingSegments?.length ?? 0, cuts: Math.max(0, (pacingSegments?.length ?? 1) - 1), beats: plan.filter(segment => segment.source === 'beat').length, plan };
     }
     canvas.width = filter ? reframe.targetWidth : inputWidth || DEFAULT_CANVAS.width;
     canvas.height = filter ? reframe.targetHeight : inputHeight || DEFAULT_CANVAS.height;

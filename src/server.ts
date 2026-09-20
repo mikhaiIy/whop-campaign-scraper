@@ -172,7 +172,7 @@ export function createServer(source = new CampaignSource(), configStore = new Co
     fromCache: clip.result.fromCache,
     verticalPath: clip.render?.outputPath ?? null,
     captions: clip.render ? { cards: clip.render.stages.captions.cards, warnings: clip.render.stages.captions.warnings } : null,
-    pacing: clip.render ? { segments: clip.render.stages.pacing.segments, cuts: clip.render.stages.pacing.cuts } : null,
+    pacing: clip.render ? { segments: clip.render.stages.pacing.segments, cuts: clip.render.stages.pacing.cuts, beats: clip.render.stages.pacing.beats } : null,
     loudness: clip.render?.stages.loudness.measured ?? null,
     hookRating: clip.candidate.hookRating,
     momentType: clip.candidate.momentType ?? null,
