@@ -164,3 +164,37 @@ test('renderClip reframes a landscape cut to 9:16 and authors captions for it', 
   assert.match(ass, /PlayResX: 1080/);
   assert.match(ass, /PlayResY: 1920/);
 });
+
+test('renderClip offsets the reframe crop to the detected face', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'focus-'));
+  await writeFile(join(dir, 'in.mp4'), 'fake');
+  const pythonPath = join(dir, 'python');
+  const focusScript = join(dir, 'focus.py');
+  await writeFile(pythonPath, '');
+  await writeFile(focusScript, '');
+  const state = { renderArgs: null };
+  const runner = async (command, args) => {
+    if (command === pythonPath) return { stdout: '{"focusX":0.8,"faces":6,"frames":6}', stderr: '', code: 0, timedOut: false };
+    if (command === 'ffmpeg' && args.includes('-f') && args[args.indexOf('-f') + 1] === 'null') {
+      return { stdout: '', stderr: '{ "input_i" : "-20", "input_tp" : "-3", "input_lra" : "4", "input_thresh" : "-30", "target_offset" : "0.5" }', code: 0, timedOut: false };
+    }
+    if (command === 'ffmpeg') {
+      state.renderArgs = args;
+      await writeFile(args[args.length - 1], 'rendered');
+      return { stdout: '', stderr: '', code: 0, timedOut: false };
+    }
+    return {
+      stdout: JSON.stringify({ format: { duration: '5', size: '9' }, streams: [{ codec_type: 'video', codec_name: 'h264', width: 1920, height: 1080, avg_frame_rate: '30/1' }, { codec_type: 'audio', codec_name: 'aac' }] }),
+      stderr: '', code: 0, timedOut: false,
+    };
+  };
+  const paths = renderOutputPaths(dir, '0.00-5.00');
+  const result = await renderClip({
+    campaignId: 'c', videoId: 'v', inputPath: join(dir, 'in.mp4'), ...paths,
+    transcript: makeTranscript('v', 6, 0.5), clipStart: 0.5, clipEnd: 5.5,
+    captions: { enabled: true }, loudness: { enabled: true },
+  }, { runner, now: () => 0, pythonPath, focusScript });
+  assert.equal(result.stages.reframe.focusSource, 'face');
+  assert.equal(result.stages.reframe.focusX, 0.8);
+  assert.match(state.renderArgs.join(' '), /crop=1080:1920:2192:0/);
+});

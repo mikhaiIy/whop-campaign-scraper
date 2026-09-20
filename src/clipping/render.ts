@@ -81,6 +81,14 @@ export interface RenderDeps {
   durationToleranceSeconds?: number;
   refresh?: boolean;
   now?: () => number;
+  /** Local python used to run tools/focus.py; defaults to <cwd>/.venv/bin/python. */
+  pythonPath?: string;
+  /** Path to the face-focus sampler; defaults to <cwd>/tools/focus.py. */
+  focusScript?: string;
+  /** Set false to skip face detection and always center the reframe crop. */
+  faceDetect?: boolean;
+  focusSamples?: number;
+  focusTimeoutMs?: number;
 }
 
 export interface LoudnormMeasurement {
@@ -93,7 +101,7 @@ export interface LoudnormMeasurement {
 
 export interface RenderStageReport {
   tighten: { ran: boolean; command: string; args: string[]; output: string | null; warning: string | null };
-  reframe: { ran: boolean; filter: string | null; focusX: number | null };
+  reframe: { ran: boolean; filter: string | null; focusX: number | null; focusSource: 'request' | 'face' | 'center' };
   captions: { ran: boolean; path: string | null; cards: number; warnings: string[] };
   loudness: { ran: boolean; measured: LoudnormMeasurement | null };
 }
@@ -207,9 +215,7 @@ export function resolveReframeOptions(options: ReframeOptions = {}): ResolvedRef
   };
 }
 
-const toEven = (value: number): number => (value % 2 === 0 ? value : value + 1);
-
-/**
+const toEven = (value: number): number => (value % 2 === 0 ? value : value + 1);/**
  * Scale-to-cover, then crop to the target, centering horizontally on `focusX`.
  * Returns null when the input already matches the target size.
  */
@@ -225,6 +231,42 @@ export function buildReframeFilter(inputWidth: number, inputHeight: number, opti
   const maxY = Math.max(0, scaledHeight - options.targetHeight);
   const y = toEven(Math.round(Math.min(Math.max((scaledHeight - options.targetHeight) / 2, 0), maxY)));
   return `scale=${scaledWidth}:${scaledHeight},crop=${options.targetWidth}:${options.targetHeight}:${x}:${y}`;
+}
+
+export interface FocusResult {
+  focusX: number | null;
+  faces: number;
+  frames: number;
+}
+
+/** Parse the JSON emitted by tools/focus.py; returns null when it is absent or malformed. */
+export function parseFocusOutput(stdout: string): FocusResult | null {
+  const match = stdout.match(/\{[\s\S]*?\}/);
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[0]) as Record<string, unknown>;
+    const rawFocus = parsed.focusX;
+    const focusX = typeof rawFocus === 'number' && Number.isFinite(rawFocus) ? Math.min(1, Math.max(0, rawFocus)) : null;
+    const count = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0);
+    return { focusX, faces: count(parsed.faces), frames: count(parsed.frames) };
+  } catch {
+    return null;
+  }
+}
+
+/** Sample the input for a dominant face; null means "no confident focus, center the crop". */
+async function detectFocus(inputPath: string, runner: ProcessRunner, deps: RenderDeps): Promise<FocusResult | null> {
+  const python = deps.pythonPath ?? join(process.cwd(), '.venv/bin/python');
+  const script = deps.focusScript ?? join(process.cwd(), 'tools/focus.py');
+  if (!(await stat(python).catch(() => null)) || !(await stat(script).catch(() => null))) return null;
+  const samples = Math.max(1, Math.round(deps.focusSamples ?? 12));
+  try {
+    const result = await runner(python, [script, inputPath, '--samples', String(samples)], deps.focusTimeoutMs ?? 120_000);
+    if (result.code !== 0) return null;
+    return parseFocusOutput(result.stdout);
+  } catch {
+    return null;
+  }
 }
 
 const hexToAssColor = (hex: string): string => {
@@ -450,7 +492,7 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
       if (probe.durationSeconds > 0 && Math.abs(probe.durationSeconds - expected) <= tolerance) {
         return {
           outputPath: request.outputPath, sidecarPath: request.sidecarPath, assPath: null, probe, fromCache: true,
-          stages: { tighten: { ran: false, command: tighten.command, args: [], output: null, warning: null }, reframe: { ran: false, filter: null, focusX: reframe.focusX }, captions: { ran: false, path: null, cards: 0, warnings: [] }, loudness: { ran: false, measured: null } },
+          stages: { tighten: { ran: false, command: tighten.command, args: [], output: null, warning: null }, reframe: { ran: false, filter: null, focusX: reframe.focusX, focusSource: reframe.focusX === null ? 'center' : 'request' }, captions: { ran: false, path: null, cards: 0, warnings: [] }, loudness: { ran: false, measured: null } },
         };
       }
     } catch { /* unreadable; re-render */ }
@@ -458,7 +500,7 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
 
   const stageReport: RenderStageReport = {
     tighten: { ran: false, command: tighten.command, args: [], output: null, warning: null },
-    reframe: { ran: false, filter: null, focusX: reframe.focusX },
+    reframe: { ran: false, filter: null, focusX: reframe.focusX, focusSource: reframe.focusX === null ? 'center' : 'request' },
     captions: { ran: false, path: null, cards: 0, warnings: [] },
     loudness: { ran: false, measured: null },
   };
@@ -488,8 +530,14 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
     const inputProbe = await probeMedia(workingInput, { command: probeCommand, runner, timeoutMs: 60_000 }).catch(() => null);
     const inputWidth = inputProbe?.width ?? 0;
     const inputHeight = inputProbe?.height ?? 0;
-    const filter = buildReframeFilter(inputWidth, inputHeight, reframe);
-    stageReport.reframe = { ran: Boolean(filter), filter, focusX: reframe.focusX };
+    let focusX = reframe.focusX;
+    let focusSource: 'request' | 'face' | 'center' = focusX === null ? 'center' : 'request';
+    if (focusX === null && deps.faceDetect !== false) {
+      const detected = await detectFocus(workingInput, runner, deps);
+      if (detected && detected.focusX !== null) { focusX = detected.focusX; focusSource = 'face'; }
+    }
+    const filter = buildReframeFilter(inputWidth, inputHeight, { ...reframe, focusX });
+    stageReport.reframe = { ran: Boolean(filter), filter, focusX, focusSource };
     canvas.width = filter ? reframe.targetWidth : inputWidth || DEFAULT_CANVAS.width;
     canvas.height = filter ? reframe.targetHeight : inputHeight || DEFAULT_CANVAS.height;
   } else {

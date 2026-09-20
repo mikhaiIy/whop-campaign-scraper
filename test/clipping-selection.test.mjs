@@ -4,7 +4,7 @@ import {
   applyHookGate, buildRerankPrompt, dedupeCandidates, mmrSelect, parseRerank,
   rerankCandidates, textCosine, timeIoU,
 } from '../dist/clipping/moments.js';
-import { buildReframeFilter, buildRenderArgs, resolveCaptionOptions, buildAss } from '../dist/clipping/render.js';
+import { buildReframeFilter, buildRenderArgs, parseFocusOutput, resolveCaptionOptions, buildAss } from '../dist/clipping/render.js';
 
 const candidate = (start, end, hookRating, reason = 'r') => ({ start, end, hookRating, reason, rulesChecked: [] });
 
@@ -129,6 +129,13 @@ test('buildRenderArgs chains the reframe filter before the subtitles filter', ()
     loudness: { enabled: true, targetI: -14, targetTP: -1.5, targetLRA: 11, linear: true },
   });
   assert.ok(args.join(' ').includes('-vf scale=3414:1920,crop=1080:1920:1168:0,subtitles=filename=\'/subs.ass\''));
+});
+
+test('parseFocusOutput reads the detector JSON and clamps the focus', () => {
+  assert.deepEqual(parseFocusOutput('{"focusX":0.8,"faces":6,"frames":6}'), { focusX: 0.8, faces: 6, frames: 6 });
+  assert.deepEqual(parseFocusOutput('log line\n{"focusX":1.4,"faces":2,"frames":4}\n'), { focusX: 1, faces: 2, frames: 4 });
+  assert.deepEqual(parseFocusOutput('{"focusX":null,"faces":0,"frames":6}'), { focusX: null, faces: 0, frames: 6 });
+  assert.equal(parseFocusOutput('no json here'), null);
 });
 
 test('resolveCaptionOptions scales captions to a non-vertical canvas', () => {

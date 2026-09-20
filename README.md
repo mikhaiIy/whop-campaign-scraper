@@ -90,7 +90,9 @@ diversity (λ = 0.7) so one batch is not five versions of the same moment.
 **The render stage** (`enhance: true`) tightens dead air with auto-editor,
 reframes to 1080×1920 (scale-to-cover, then crop), burns word-synced ASS captions
 authored for the output canvas, and normalizes audio to −14 LUFS / −1.5 dBTP /
-LRA 11 in a single ffmpeg pass. Each render writes a sidecar
+LRA 11 in a single ffmpeg pass. Reframing samples the clip for a dominant face
+(`tools/focus.py`, OpenCV Haar cascade) and centers the crop on it, falling back
+to a centered crop when no face is found. Each render writes a sidecar
 (`<clip>.vertical.json`) with the measured loudness, the exact ffmpeg args and
 the output probe. The console exposes the same path as a **Vertical + captions**
 toggle.

@@ -1,1 +1,4 @@
 auto-editor==29.3.1
+# Face detection for the 9:16 reframe. 4.x is required: OpenCV 5 dropped the
+# bundled Haar cascades that tools/focus.py relies on.
+opencv-python-headless==4.11.0.86
