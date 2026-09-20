@@ -172,6 +172,7 @@ export function createServer(source = new CampaignSource(), configStore = new Co
     fromCache: clip.result.fromCache,
     verticalPath: clip.render?.outputPath ?? null,
     captions: clip.render ? { cards: clip.render.stages.captions.cards, warnings: clip.render.stages.captions.warnings } : null,
+    pacing: clip.render ? { segments: clip.render.stages.pacing.segments, cuts: clip.render.stages.pacing.cuts } : null,
     loudness: clip.render?.stages.loudness.measured ?? null,
     hookRating: clip.candidate.hookRating,
     momentType: clip.candidate.momentType ?? null,
@@ -217,7 +218,7 @@ export function createServer(source = new CampaignSource(), configStore = new Co
     };
   }));
   server.registerTool('produce_campaign_clips', {
-    description: 'Cut real clip files: ingest audio, transcribe, select moments (fused with audio-energy and scene-cut signals, with a payoff requirement and a hook start), download only the video sections around the chosen moments, snap the bounds to word timings, and re-encode each clip with ffmpeg. Verifies every output duration with ffprobe and writes a sidecar JSON per clip with both source-absolute and section-relative timecodes, the word-level transcript excerpt, the rule provenance, and the stated duration assumption. Set enhance=true to also render a vertical 1080x1920 deliverable with burned word-synced captions and -14 LUFS loudness normalization.',
+    description: 'Cut real clip files: ingest audio, transcribe, select moments (fused with audio-energy and scene-cut signals, with a payoff requirement and a hook start), download only the video sections around the chosen moments, snap the bounds to word timings, and re-encode each clip with ffmpeg. Verifies every output duration with ffprobe and writes a sidecar JSON per clip with both source-absolute and section-relative timecodes, the word-level transcript excerpt, the rule provenance, and the stated duration assumption. Set enhance=true to also render a vertical 1080x1920 deliverable with burned word-synced captions, beat-driven punch-ins, and -14 LUFS loudness normalization.',
     inputSchema: { id: z.string().uuid(), video_id: z.string().trim().min(1), limit: z.number().int().min(1).max(20).optional(), out_dir: z.string().trim().min(1).optional(), padding_seconds: z.number().min(0).max(30).optional(), enhance: z.boolean().optional(), refresh: z.boolean().optional() }, annotations: writeAnnotations,
   }, args => result('produce_campaign_clips', args, async () => {
     const { id, video_id, limit, out_dir, padding_seconds, enhance, refresh } = args as { id: string; video_id: string; limit?: number; out_dir?: string; padding_seconds?: number; enhance?: boolean; refresh?: boolean };

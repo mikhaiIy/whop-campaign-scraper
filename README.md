@@ -109,6 +109,15 @@ to a centered crop when no face is found. Each render writes a sidecar
 the output probe. The console exposes the same path as a **Vertical + captions**
 toggle.
 
+**The pacing pass** inserts beat-driven punch-ins so the frame never holds longer
+than ~5.5s (attention-synchrony research; see
+`docs/research/short-form-clipping-playbook.md`). Sentence starts and pauses over
+0.45s are preferred cut points; when none fall in the window a cut is forced at
+the ceiling. Shots alternate between the full frame and a 15% punch-in, each held
+for at least 2.5s. The planner (`planPacing`) is pure and testable; the segments
+are concatenated in the same ffmpeg pass as the reframe, captions and loudness.
+The stage report records the segment plan.
+
 ---
 
 ## Harness wiring

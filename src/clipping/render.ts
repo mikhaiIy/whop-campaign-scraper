@@ -86,6 +86,8 @@ export interface RenderRequest {
   tighten?: TightenOptions;
   reframe?: ReframeOptions;
   coldOpen?: ColdOpenOptions;
+  /** Insert beat-driven punch-ins so the frame changes every few seconds. */
+  pacing?: PacingOptions;
 }
 
 export interface RenderDeps {
@@ -119,6 +121,7 @@ export interface RenderStageReport {
   tighten: { ran: boolean; command: string; args: string[]; output: string | null; warning: string | null };
   reframe: { ran: boolean; filter: string | null; focusX: number | null; focusSource: 'request' | 'face' | 'center' };
   coldOpen: { ran: boolean; startSeconds: number; durationSeconds: number };
+  pacing: { ran: boolean; segments: number; cuts: number; plan: PacingSegmentPlan[] };
   captions: { ran: boolean; path: string | null; cards: number; warnings: string[] };
   loudness: { ran: boolean; measured: LoudnormMeasurement | null };
 }
@@ -180,7 +183,7 @@ export function resolveCaptionOptions(options: CaptionOptions = {}): ResolvedCap
     enabled: options.enabled ?? true,
     maxWordsPerCard: Math.max(1, Math.min(6, Math.round(asNumber(options.maxWordsPerCard, 3)))),
     maxGapSeconds: asNumber(options.maxGapSeconds, 0.7),
-    minCardSeconds: Math.max(0, asNumber(options.minCardSeconds, 0.4)),
+    minCardSeconds: Math.max(0, asNumber(options.minCardSeconds, 0.8)),
     fontName: options.fontName ?? 'DejaVu Sans',
     fontSize: Math.max(24, Math.min(200, Math.round(asNumber(fontAtCanvas, 72)))),
     keywordColor: options.keywordColor ?? '#FFE500',
@@ -215,6 +218,8 @@ export interface ReframeOptions {
   targetHeight?: number;
   /** Horizontal focus in [0,1] (0 = left, 1 = right); null centers the crop. */
   focusX?: number | null;
+  /** Punch-in factor; 1 keeps the full frame, 1.15 crops 15% tighter. */
+  zoom?: number;
 }
 
 export interface ResolvedReframeOptions {
@@ -222,6 +227,7 @@ export interface ResolvedReframeOptions {
   targetWidth: number;
   targetHeight: number;
   focusX: number | null;
+  zoom: number;
 }
 
 export function resolveReframeOptions(options: ReframeOptions = {}): ResolvedReframeOptions {
@@ -231,6 +237,7 @@ export function resolveReframeOptions(options: ReframeOptions = {}): ResolvedRef
     targetWidth: Math.max(2, Math.round(asNumber(options.targetWidth, DEFAULT_CANVAS.width))),
     targetHeight: Math.max(2, Math.round(asNumber(options.targetHeight, DEFAULT_CANVAS.height))),
     focusX: typeof focus === 'number' && Number.isFinite(focus) ? Math.min(1, Math.max(0, focus)) : null,
+    zoom: Math.min(2, Math.max(1, asNumber(options.zoom, 1))),
   };
 }
 
@@ -245,6 +252,98 @@ export function resolveColdOpenOptions(options: ColdOpenOptions = {}, clipDurati
   return { enabled, startSeconds, durationSeconds };
 }
 
+export interface PacingOptions {
+  enabled?: boolean;
+  /** Preferred maximum time a shot may hold before a visual change. */
+  maxSecondsBetweenCuts?: number;
+  /** Never place two visual changes closer than this. */
+  minSecondsBetweenCuts?: number;
+  /** Punch-in amount as a fraction (0.15 = 15% tighter). */
+  zoomAmount?: number;
+  /** Clips shorter than this are left as one continuous shot. */
+  minClipSeconds?: number;
+  /** A pause at least this long also marks a shot boundary. */
+  sentencePauseSeconds?: number;
+}
+
+export interface ResolvedPacingOptions {
+  enabled: boolean;
+  maxSecondsBetweenCuts: number;
+  minSecondsBetweenCuts: number;
+  zoomAmount: number;
+  minClipSeconds: number;
+  sentencePauseSeconds: number;
+}
+
+export function resolvePacingOptions(options: PacingOptions = {}): ResolvedPacingOptions {
+  const min = Math.min(8, Math.max(1, asNumber(options.minSecondsBetweenCuts, 2.5)));
+  const max = Math.min(8, Math.max(min, asNumber(options.maxSecondsBetweenCuts, 5.5)));
+  return {
+    enabled: options.enabled ?? false,
+    maxSecondsBetweenCuts: max,
+    minSecondsBetweenCuts: min,
+    zoomAmount: Math.min(0.5, Math.max(0, asNumber(options.zoomAmount, 0.15))),
+    minClipSeconds: Math.max(0, asNumber(options.minClipSeconds, 3)),
+    sentencePauseSeconds: Math.max(0.1, asNumber(options.sentencePauseSeconds, 0.45)),
+  };
+}
+
+export interface PacingSegmentPlan {
+  /** Clip-relative start in seconds. */
+  start: number;
+  duration: number;
+  /** Punch-in factor for this shot; 1 is the full frame. */
+  zoom: number;
+}
+
+const SENTENCE_END = /[.!?…]["')\]]*$/;
+
+/**
+ * Place visual changes across a clip so the frame never holds longer than
+ * `maxSecondsBetweenCuts`. Boundaries prefer sentence starts and long pauses,
+ * falling back to a forced cut at the ceiling. Shots alternate between the
+ * full frame and a punch-in, which reads as a cut-equivalent attention reset
+ * without breaking continuity. Returns [] when the clip is too short or has no
+ * words to anchor a boundary.
+ */
+export function planPacing(words: WordTiming[], clipStart: number, clipEnd: number, options: PacingOptions = {}): PacingSegmentPlan[] {
+  const resolved = resolvePacingOptions(options);
+  const duration = Math.max(0, clipEnd - clipStart);
+  if (!resolved.enabled || duration < resolved.minClipSeconds) return [];
+  const inRange = words
+    .filter(word => word.end > clipStart && word.start < clipEnd)
+    .map(word => ({ start: Math.max(0, word.start - clipStart), end: Math.max(0, word.end - clipStart), word: word.word.trim() }))
+    .filter(word => word.word.length > 0 && word.end > word.start)
+    .sort((a, b) => a.start - b.start);
+  if (inRange.length < 2) return [];
+
+  const candidates: number[] = [];
+  for (let index = 1; index < inRange.length; index++) {
+    const previous = inRange[index - 1];
+    const gap = inRange[index].start - previous.end;
+    if (SENTENCE_END.test(previous.word) || gap > resolved.sentencePauseSeconds) candidates.push(inRange[index].start);
+  }
+  const unique = [...new Set(candidates)].filter(time => time > 0 && time < duration).sort((a, b) => a - b);
+
+  const target = (resolved.minSecondsBetweenCuts + resolved.maxSecondsBetweenCuts) / 2;
+  const segments: PacingSegmentPlan[] = [];
+  let cursor = 0;
+  let guard = 0;
+  while (duration - cursor > resolved.minSecondsBetweenCuts && guard++ < 200) {
+    const min = cursor + resolved.minSecondsBetweenCuts;
+    const max = Math.min(cursor + resolved.maxSecondsBetweenCuts, duration);
+    const window = unique.filter(time => time >= min && time <= max);
+    const cut = window.length
+      ? window.reduce((best, time) => (Math.abs(time - (cursor + target)) < Math.abs(best - (cursor + target)) ? time : best), window[0])
+      : max;
+    if (cut - cursor < resolved.minSecondsBetweenCuts) break;
+    segments.push({ start: cursor, duration: cut - cursor, zoom: segments.length % 2 === 1 ? 1 + resolved.zoomAmount : 1 });
+    cursor = cut;
+  }
+  if (cursor < duration - 1e-6) segments.push({ start: cursor, duration: duration - cursor, zoom: segments.length % 2 === 1 ? 1 + resolved.zoomAmount : 1 });
+  return segments.length > 1 ? segments : [];
+}
+
 function loudnormFilter(loudness: Required<LoudnessOptions>, measured: LoudnormMeasurement | null | undefined): string {
   const measuredArgs = measured
     ? `:measured_I=${measured.input_i}:measured_TP=${measured.input_tp}:measured_LRA=${measured.input_lra}:measured_thresh=${measured.input_thresh}:offset=${measured.target_offset}`
@@ -256,8 +355,9 @@ function loudnormFilter(loudness: Required<LoudnessOptions>, measured: LoudnormM
  */
 export function buildReframeFilter(inputWidth: number, inputHeight: number, options: ResolvedReframeOptions): string | null {
   if (!(inputWidth > 0) || !(inputHeight > 0)) return null;
-  if (inputWidth === options.targetWidth && inputHeight === options.targetHeight) return null;
-  const factor = Math.max(options.targetWidth / inputWidth, options.targetHeight / inputHeight);
+  const zoom = Math.min(2, Math.max(1, options.zoom ?? 1));
+  if (zoom === 1 && inputWidth === options.targetWidth && inputHeight === options.targetHeight) return null;
+  const factor = Math.max(options.targetWidth / inputWidth, options.targetHeight / inputHeight) * zoom;
   const scaledWidth = toEven(Math.ceil(inputWidth * factor));
   const scaledHeight = toEven(Math.ceil(inputHeight * factor));
   const centerX = (options.focusX ?? 0.5) * scaledWidth;
@@ -482,30 +582,68 @@ export function ffmpegSubtitlesFilter(assPath: string): string {
   return `subtitles=filename='${escapeFilterPath(assPath)}'`;
 }
 
-export function buildRenderArgs(request: { inputPath: string; outputPath: string; assPath?: string | null; reframeFilter?: string | null; coldOpen?: { startSeconds: number; durationSeconds: number } | null; loudness?: Required<LoudnessOptions>; measured?: LoudnormMeasurement | null }): string[] {
+export interface PacingRenderSegment {
+  /** Input-relative start in seconds. */
+  start: number;
+  duration: number;
+  zoom: number;
+  /** Reframe/zoom filter for this shot; null means the input is already the target size. */
+  filter: string | null;
+}
+
+export interface RenderArgsRequest {
+  inputPath: string;
+  outputPath: string;
+  assPath?: string | null;
+  reframeFilter?: string | null;
+  /** Beat-driven shots; more than one switches the video graph to a concat. */
+  segments?: PacingRenderSegment[] | null;
+  coldOpen?: { startSeconds: number; durationSeconds: number } | null;
+  loudness?: Required<LoudnessOptions>;
+  measured?: LoudnormMeasurement | null;
+}
+
+export function buildRenderArgs(request: RenderArgsRequest): string[] {
   const args = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-i', request.inputPath];
   const cold = request.coldOpen && request.coldOpen.durationSeconds > 0 ? request.coldOpen : null;
-  if (cold) {
-    const pre = request.reframeFilter ? `${request.reframeFilter},` : '';
-    const subs = request.assPath ? `[vcat]${ffmpegSubtitlesFilter(request.assPath)}[vout]` : null;
-    const loud = request.loudness?.enabled ? `[acat]${loudnormFilter(request.loudness, request.measured)}[aout]` : null;
-    const complex = [
-      `[0:v]trim=start=${cold.startSeconds}:duration=${cold.durationSeconds},setpts=PTS-STARTPTS,${pre}format=yuv420p,setsar=1[v0]`,
-      `[0:v]setpts=PTS-STARTPTS,${pre}format=yuv420p,setsar=1[v1]`,
-      '[v0][v1]concat=n=2:v=1:a=0[vcat]',
-      ...(subs ? [subs] : []),
-      `[0:a]atrim=start=${cold.startSeconds}:duration=${cold.durationSeconds},asetpts=PTS-STARTPTS[a0]`,
-      '[0:a]asetpts=PTS-STARTPTS[a1]',
-      '[a0][a1]concat=n=2:v=0:a=1[acat]',
-      ...(loud ? [loud] : []),
-    ].join(';');
-    args.push('-filter_complex', complex, '-map', subs ? '[vout]' : '[vcat]', '-map', loud ? '[aout]' : '[acat]');
-  } else {
+  const segments = request.segments && request.segments.length > 1 ? request.segments : null;
+  const loud = request.loudness?.enabled ? loudnormFilter(request.loudness, request.measured) : null;
+
+  if (!cold && !segments) {
     const filters: string[] = [];
     if (request.reframeFilter) filters.push(request.reframeFilter);
     if (request.assPath) filters.push(ffmpegSubtitlesFilter(request.assPath));
     if (filters.length) args.push('-vf', filters.join(','));
-    if (request.loudness?.enabled) args.push('-af', loudnormFilter(request.loudness, request.measured));
+    if (loud) args.push('-af', loud);
+  } else {
+    const graph: string[] = [];
+    const videoLabels: string[] = [];
+    const pushShot = (label: string, filter: string | null, trim?: { start: number; duration: number }): void => {
+      const head = trim ? `trim=start=${trim.start}:duration=${trim.duration},setpts=PTS-STARTPTS,` : 'setpts=PTS-STARTPTS,';
+      graph.push(`[0:v]${head}${filter ? `${filter},` : ''}format=yuv420p,setsar=1[${label}]`);
+      videoLabels.push(label);
+    };
+    let index = 0;
+    if (cold) pushShot(`v${index++}`, request.reframeFilter ?? null, { start: cold.startSeconds, duration: cold.durationSeconds });
+    if (segments) {
+      for (const segment of segments) pushShot(`v${index++}`, segment.filter, { start: segment.start, duration: segment.duration });
+    } else {
+      pushShot(`v${index}`, request.reframeFilter ?? null);
+    }
+    graph.push(`[${videoLabels.join('][')}]concat=n=${videoLabels.length}:v=1:a=0[vcat]`);
+    const videoOut = request.assPath ? 'vout' : 'vcat';
+    if (request.assPath) graph.push(`[vcat]${ffmpegSubtitlesFilter(request.assPath)}[vout]`);
+
+    if (cold) {
+      graph.push(`[0:a]atrim=start=${cold.startSeconds}:duration=${cold.durationSeconds},asetpts=PTS-STARTPTS[a0]`);
+      graph.push('[0:a]asetpts=PTS-STARTPTS[a1]');
+      graph.push('[a0][a1]concat=n=2:v=0:a=1[acat]');
+    } else {
+      graph.push('[0:a]asetpts=PTS-STARTPTS[acat]');
+    }
+    const audioOut = loud ? 'aout' : 'acat';
+    if (loud) graph.push(`[acat]${loud}[aout]`);
+    args.push('-filter_complex', graph.join(';'), '-map', `[${videoOut}]`, '-map', `[${audioOut}]`);
   }
   args.push(
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
@@ -549,6 +687,7 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
   const tighten = resolveTightenOptions(request.tighten);
   const reframe = resolveReframeOptions(request.reframe);
   const coldOpen = resolveColdOpenOptions(request.coldOpen, Math.max(0, request.clipEnd - request.clipStart));
+  const pacing = resolvePacingOptions(request.pacing);
   const expectedDuration = Math.max(0, request.clipEnd - request.clipStart) + (coldOpen.enabled ? coldOpen.durationSeconds : 0);
   await mkdir(dirname(request.outputPath), { recursive: true });
 
@@ -558,7 +697,7 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
       if (probe.durationSeconds > 0 && Math.abs(probe.durationSeconds - expectedDuration) <= tolerance) {
         return {
           outputPath: request.outputPath, sidecarPath: request.sidecarPath, assPath: null, probe, fromCache: true,
-          stages: { tighten: { ran: false, command: tighten.command, args: [], output: null, warning: null }, reframe: { ran: false, filter: null, focusX: reframe.focusX, focusSource: reframe.focusX === null ? 'center' : 'request' }, coldOpen: { ran: false, startSeconds: coldOpen.startSeconds, durationSeconds: coldOpen.durationSeconds }, captions: { ran: false, path: null, cards: 0, warnings: [] }, loudness: { ran: false, measured: null } },
+          stages: { tighten: { ran: false, command: tighten.command, args: [], output: null, warning: null }, reframe: { ran: false, filter: null, focusX: reframe.focusX, focusSource: reframe.focusX === null ? 'center' : 'request' }, coldOpen: { ran: false, startSeconds: coldOpen.startSeconds, durationSeconds: coldOpen.durationSeconds }, pacing: { ran: false, segments: 0, cuts: 0, plan: [] }, captions: { ran: false, path: null, cards: 0, warnings: [] }, loudness: { ran: false, measured: null } },
         };
       }
     } catch { /* unreadable; re-render */ }
@@ -568,6 +707,7 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
     tighten: { ran: false, command: tighten.command, args: [], output: null, warning: null },
     reframe: { ran: false, filter: null, focusX: reframe.focusX, focusSource: reframe.focusX === null ? 'center' : 'request' },
     coldOpen: { ran: coldOpen.enabled, startSeconds: coldOpen.startSeconds, durationSeconds: coldOpen.durationSeconds },
+    pacing: { ran: false, segments: 0, cuts: 0, plan: [] },
     captions: { ran: false, path: null, cards: 0, warnings: [] },
     loudness: { ran: false, measured: null },
   };
@@ -592,6 +732,7 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
   }
 
   let assPath: string | null = null;
+  let pacingSegments: PacingRenderSegment[] | null = null;
   const canvas = { width: 0, height: 0 };
   if (reframe.enabled) {
     const inputProbe = await probeMedia(workingInput, { command: probeCommand, runner, timeoutMs: 60_000 }).catch(() => null);
@@ -605,6 +746,16 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
     }
     const filter = buildReframeFilter(inputWidth, inputHeight, { ...reframe, focusX });
     stageReport.reframe = { ran: Boolean(filter), filter, focusX, focusSource };
+    if (pacing.enabled) {
+      const plan = planPacing(flattenWords(request.transcript), request.clipStart, request.clipEnd, request.pacing);
+      if (plan.length > 1) {
+        pacingSegments = plan.map(segment => {
+          const zoom = Math.min(2, segment.zoom * reframe.zoom);
+          return { start: segment.start, duration: segment.duration, zoom, filter: buildReframeFilter(inputWidth, inputHeight, { ...reframe, focusX, zoom }) };
+        });
+      }
+      stageReport.pacing = { ran: pacingSegments !== null, segments: pacingSegments?.length ?? 0, cuts: Math.max(0, (pacingSegments?.length ?? 1) - 1), plan };
+    }
     canvas.width = filter ? reframe.targetWidth : inputWidth || DEFAULT_CANVAS.width;
     canvas.height = filter ? reframe.targetHeight : inputHeight || DEFAULT_CANVAS.height;
   } else {
@@ -633,7 +784,7 @@ export async function renderClip(request: RenderRequest, deps: RenderDeps = {}):
     }
   }
 
-  const args = buildRenderArgs({ inputPath: workingInput, outputPath: request.outputPath, assPath, reframeFilter: stageReport.reframe.filter, coldOpen: coldOpen.enabled ? { startSeconds: coldOpen.startSeconds, durationSeconds: coldOpen.durationSeconds } : null, loudness, measured: stageReport.loudness.measured });
+  const args = buildRenderArgs({ inputPath: workingInput, outputPath: request.outputPath, assPath, reframeFilter: stageReport.reframe.filter, segments: pacingSegments, coldOpen: coldOpen.enabled ? { startSeconds: coldOpen.startSeconds, durationSeconds: coldOpen.durationSeconds } : null, loudness, measured: stageReport.loudness.measured });
   const result = await runner(ffmpeg, args, timeoutMs);
   if (result.code !== 0) {
     throw new Error(`render ffmpeg failed (exit ${result.code}): ${result.stderr.trim().split('\n').slice(-3).join(' ').slice(0, 500) || 'no stderr'}`);

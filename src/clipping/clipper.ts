@@ -10,7 +10,7 @@ import {
 } from './moments.js';
 import { collectEmotionSignals, collectSignals, mergeSignals, sourcePotential, type MediaSignals, type SourcePotential } from './signals.js';
 import { collectChatSignals } from './chat.js';
-import { renderClip, renderOutputPaths, type CaptionOptions, type LoudnessOptions, type RenderResult, type TightenOptions } from './render.js';
+import { renderClip, renderOutputPaths, type CaptionOptions, type LoudnessOptions, type PacingOptions, type RenderResult, type TightenOptions } from './render.js';
 import { TranscriptionCache, flattenWords, shiftTranscript, transcriptDuration, type Transcript } from './transcribe.js';
 import type { ProcessRunner } from './youtube.js';
 
@@ -55,6 +55,8 @@ export interface AssembleOptions extends PrepareOptions {
   captions?: CaptionOptions;
   loudness?: LoudnessOptions;
   tighten?: TightenOptions;
+  /** Beat-driven punch-ins; defaults on when enhance is set. */
+  pacing?: PacingOptions;
 }
 
 export interface ClipArtifact {
@@ -239,6 +241,7 @@ export class ClipAssembler {
               captions: options.captions,
               loudness: options.loudness,
               tighten: options.tighten,
+              pacing: options.pacing ?? { enabled: true },
               coldOpen: item.candidate.signalPeakSeconds !== null && item.candidate.signalPeakSeconds !== undefined
                 ? { enabled: true, startSeconds: Math.max(0, item.candidate.signalPeakSeconds - item.snap.start), durationSeconds: 0.8 }
                 : undefined,
