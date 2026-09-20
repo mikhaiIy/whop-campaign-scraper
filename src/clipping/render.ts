@@ -1,0 +1,544 @@
+import { mkdir, stat, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { probeMedia, type MediaProbe } from './media.js';
+import { flattenWords, type Transcript, type WordTiming } from './transcribe.js';
+import { defaultProcessRunner, type ProcessRunner } from './youtube.js';
+
+/**
+ * Render layer for the clipping pipeline.
+ *
+ * A cut clip is a plain, horizontal re-encode. This module turns it into a
+ * postable short: optional dead-air tightening (auto-editor), then a single
+ * final encode that burns word-synced ASS captions and normalizes loudness to
+ * the short-form target. Every ffmpeg argument is produced by a pure builder so
+ * the pipeline stays testable without touching a real media file.
+ */
+
+export const SHORT_FORM_LOUDNESS = { targetI: -14, targetTP: -1.5, targetLRA: 11 } as const;
+
+/** Universal 1080x1920 text box (x130-890 / y288-1248), anchored to Meta's published ratio. */
+export const DEFAULT_SAFE_BOX = { marginLeft: 130, marginRight: 190, marginBottom: 672 } as const;
+
+export const DEFAULT_CANVAS = { width: 1080, height: 1920 } as const;
+
+/** DEFAULT_SAFE_BOX expressed as fractions of the canvas, so caption geometry survives any aspect. */
+export const SAFE_BOX_RATIO = {
+  left: DEFAULT_SAFE_BOX.marginLeft / DEFAULT_CANVAS.width,
+  right: DEFAULT_SAFE_BOX.marginRight / DEFAULT_CANVAS.width,
+  bottom: DEFAULT_SAFE_BOX.marginBottom / DEFAULT_CANVAS.height,
+} as const;
+
+export interface CaptionOptions {
+  enabled?: boolean;
+  maxWordsPerCard?: number;
+  maxGapSeconds?: number;
+  fontName?: string;
+  fontSize?: number;
+  keywordColor?: string;
+  outline?: number;
+  safeBox?: { marginLeft: number; marginRight: number; marginBottom: number };
+  /** Output resolution the captions are authored for; drives PlayRes, font size and margins. */
+  canvas?: { width: number; height: number };
+}
+
+export interface LoudnessOptions {
+  enabled?: boolean;
+  targetI?: number;
+  targetTP?: number;
+  targetLRA?: number;
+  linear?: boolean;
+}
+
+export interface TightenOptions {
+  enabled?: boolean;
+  marginSeconds?: number;
+  threshold?: number;
+  command?: string;
+}
+
+export interface RenderRequest {
+  campaignId: string;
+  videoId: string;
+  inputPath: string;
+  outputPath: string;
+  sidecarPath: string;
+  assPath: string;
+  transcript: Transcript;
+  clipStart: number;
+  clipEnd: number;
+  captions?: CaptionOptions;
+  loudness?: LoudnessOptions;
+  tighten?: TightenOptions;
+  reframe?: ReframeOptions;
+}
+
+export interface RenderDeps {
+  runner?: ProcessRunner;
+  ffmpegCommand?: string;
+  autoEditorCommand?: string;
+  probeCommand?: string;
+  timeoutMs?: number;
+  durationToleranceSeconds?: number;
+  refresh?: boolean;
+  now?: () => number;
+}
+
+export interface LoudnormMeasurement {
+  input_i: number;
+  input_tp: number;
+  input_lra: number;
+  input_thresh: number;
+  target_offset: number;
+}
+
+export interface RenderStageReport {
+  tighten: { ran: boolean; command: string; args: string[]; output: string | null; warning: string | null };
+  reframe: { ran: boolean; filter: string | null; focusX: number | null };
+  captions: { ran: boolean; path: string | null; cards: number; warnings: string[] };
+  loudness: { ran: boolean; measured: LoudnormMeasurement | null };
+}
+
+export interface RenderResult {
+  outputPath: string;
+  sidecarPath: string;
+  assPath: string | null;
+  probe: MediaProbe;
+  stages: RenderStageReport;
+  fromCache: boolean;
+}
+
+export interface RenderSidecar {
+  campaignId: string;
+  videoId: string;
+  inputPath: string;
+  outputPath: string;
+  clip: { start: number; end: number; durationSeconds: number };
+  stages: RenderStageReport;
+  loudnessTarget: { targetI: number; targetTP: number; targetLRA: number };
+  render: { reencode: true; ffmpegArgs: string[]; outputProbe: MediaProbe };
+  createdAt: string;
+}
+
+const asNumber = (value: unknown, fallback: number): number => (typeof value === 'number' && Number.isFinite(value) ? value : fallback);
+
+export interface ResolvedCaptionOptions {
+  enabled: boolean;
+  maxWordsPerCard: number;
+  maxGapSeconds: number;
+  fontName: string;
+  fontSize: number;
+  keywordColor: string;
+  outline: number;
+  safeBox: { marginLeft: number; marginRight: number; marginBottom: number };
+  canvas: { width: number; height: number };
+}
+
+export function resolveCaptionOptions(options: CaptionOptions = {}): ResolvedCaptionOptions {
+  const canvas = {
+    width: Math.max(1, Math.round(asNumber(options.canvas?.width, DEFAULT_CANVAS.width))),
+    height: Math.max(1, Math.round(asNumber(options.canvas?.height, DEFAULT_CANVAS.height))),
+  };
+  const safeBox = options.safeBox
+    ? {
+        marginLeft: Math.max(0, Math.round(asNumber(options.safeBox.marginLeft, DEFAULT_SAFE_BOX.marginLeft))),
+        marginRight: Math.max(0, Math.round(asNumber(options.safeBox.marginRight, DEFAULT_SAFE_BOX.marginRight))),
+        marginBottom: Math.max(0, Math.round(asNumber(options.safeBox.marginBottom, DEFAULT_SAFE_BOX.marginBottom))),
+      }
+    : {
+        marginLeft: Math.max(0, Math.round(SAFE_BOX_RATIO.left * canvas.width)),
+        marginRight: Math.max(0, Math.round(SAFE_BOX_RATIO.right * canvas.width)),
+        marginBottom: Math.max(0, Math.round(SAFE_BOX_RATIO.bottom * canvas.height)),
+      };
+  const fontAtCanvas = options.fontSize ?? Math.round((72 * canvas.height) / DEFAULT_CANVAS.height);
+  return {
+    enabled: options.enabled ?? true,
+    maxWordsPerCard: Math.max(1, Math.min(6, Math.round(asNumber(options.maxWordsPerCard, 2)))),
+    maxGapSeconds: asNumber(options.maxGapSeconds, 0.7),
+    fontName: options.fontName ?? 'DejaVu Sans',
+    fontSize: Math.max(24, Math.min(200, Math.round(asNumber(fontAtCanvas, 72)))),
+    keywordColor: options.keywordColor ?? '#FFE500',
+    outline: Math.max(0, Math.min(8, Math.round(asNumber(options.outline, 3)))),
+    safeBox,
+    canvas,
+  };
+}
+
+export function resolveLoudnessOptions(options: LoudnessOptions = {}): Required<LoudnessOptions> {
+  return {
+    enabled: options.enabled ?? true,
+    targetI: asNumber(options.targetI, SHORT_FORM_LOUDNESS.targetI),
+    targetTP: asNumber(options.targetTP, SHORT_FORM_LOUDNESS.targetTP),
+    targetLRA: asNumber(options.targetLRA, SHORT_FORM_LOUDNESS.targetLRA),
+    linear: options.linear ?? true,
+  };
+}
+
+export function resolveTightenOptions(options: TightenOptions = {}): Required<TightenOptions> {
+  return {
+    enabled: options.enabled ?? false,
+    marginSeconds: Math.max(0, asNumber(options.marginSeconds, 0.2)),
+    threshold: Math.max(0, Math.min(1, asNumber(options.threshold, 0.04))),
+    command: options.command ?? process.env.AUTO_EDITOR ?? 'auto-editor',
+  };
+}
+
+export interface ReframeOptions {
+  enabled?: boolean;
+  targetWidth?: number;
+  targetHeight?: number;
+  /** Horizontal focus in [0,1] (0 = left, 1 = right); null centers the crop. */
+  focusX?: number | null;
+}
+
+export interface ResolvedReframeOptions {
+  enabled: boolean;
+  targetWidth: number;
+  targetHeight: number;
+  focusX: number | null;
+}
+
+export function resolveReframeOptions(options: ReframeOptions = {}): ResolvedReframeOptions {
+  const focus = options.focusX;
+  return {
+    enabled: options.enabled ?? true,
+    targetWidth: Math.max(2, Math.round(asNumber(options.targetWidth, DEFAULT_CANVAS.width))),
+    targetHeight: Math.max(2, Math.round(asNumber(options.targetHeight, DEFAULT_CANVAS.height))),
+    focusX: typeof focus === 'number' && Number.isFinite(focus) ? Math.min(1, Math.max(0, focus)) : null,
+  };
+}
+
+const toEven = (value: number): number => (value % 2 === 0 ? value : value + 1);
+
+/**
+ * Scale-to-cover, then crop to the target, centering horizontally on `focusX`.
+ * Returns null when the input already matches the target size.
+ */
+export function buildReframeFilter(inputWidth: number, inputHeight: number, options: ResolvedReframeOptions): string | null {
+  if (!(inputWidth > 0) || !(inputHeight > 0)) return null;
+  if (inputWidth === options.targetWidth && inputHeight === options.targetHeight) return null;
+  const factor = Math.max(options.targetWidth / inputWidth, options.targetHeight / inputHeight);
+  const scaledWidth = toEven(Math.ceil(inputWidth * factor));
+  const scaledHeight = toEven(Math.ceil(inputHeight * factor));
+  const centerX = (options.focusX ?? 0.5) * scaledWidth;
+  const maxX = Math.max(0, scaledWidth - options.targetWidth);
+  const x = toEven(Math.round(Math.min(Math.max(centerX - options.targetWidth / 2, 0), maxX)));
+  const maxY = Math.max(0, scaledHeight - options.targetHeight);
+  const y = toEven(Math.round(Math.min(Math.max((scaledHeight - options.targetHeight) / 2, 0), maxY)));
+  return `scale=${scaledWidth}:${scaledHeight},crop=${options.targetWidth}:${options.targetHeight}:${x}:${y}`;
+}
+
+const hexToAssColor = (hex: string): string => {
+  const match = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  const value = match ? match[1] : 'FFFFFF';
+  const r = value.slice(0, 2);
+  const g = value.slice(2, 4);
+  const b = value.slice(4, 6);
+  return `&H00${b}${g}${r}`.toUpperCase();
+};
+
+export function formatAssTime(seconds: number): string {
+  const clamped = Math.max(0, seconds);
+  const totalCs = Math.round(clamped * 100);
+  const cs = totalCs % 100;
+  const totalSeconds = (totalCs - cs) / 100;
+  const s = totalSeconds % 60;
+  const totalMinutes = (totalSeconds - s) / 60;
+  const m = totalMinutes % 60;
+  const h = (totalMinutes - m) / 60;
+  const pad = (n: number, width = 2): string => String(n).padStart(width, '0');
+  return `${h}:${pad(m)}:${pad(s)}.${pad(cs)}`;
+}
+
+export function escapeAssText(text: string): string {
+  return text.replace(/\\/g, '\\\\').replace(/[{}]/g, '').replace(/\r?\n/g, ' ').trim();
+}
+
+export interface CaptionCard {
+  start: number;
+  end: number;
+  words: WordTiming[];
+}
+
+/** Group clip-relative words into caption cards of at most `maxWordsPerCard`, splitting on long pauses. */
+export function buildCaptionCards(words: WordTiming[], options: { maxWordsPerCard?: number; maxGapSeconds?: number } = {}): CaptionCard[] {
+  const maxWords = Math.max(1, options.maxWordsPerCard ?? 2);
+  const maxGap = options.maxGapSeconds ?? 0.7;
+  const cards: CaptionCard[] = [];
+  let current: WordTiming[] = [];
+  const flush = (): void => {
+    if (!current.length) return;
+    cards.push({ start: current[0].start, end: current[current.length - 1].end, words: current });
+    current = [];
+  };
+  for (const word of words) {
+    if (!word.word.trim()) continue;
+    if (current.length) {
+      const gap = word.start - current[current.length - 1].end;
+      if (gap > maxGap || current.length >= maxWords) flush();
+    }
+    current.push(word);
+  }
+  flush();
+  return cards;
+}
+
+export interface AssBuildResult {
+  ass: string;
+  cards: CaptionCard[];
+  warnings: string[];
+}
+
+function pickKeyword(card: CaptionCard): number {
+  let best = -1;
+  let bestLength = 3;
+  card.words.forEach((word, index) => {
+    const length = word.word.replace(/[^\p{L}\p{N}]/gu, '').length;
+    if (length > bestLength) { best = index; bestLength = length; }
+  });
+  return best;
+}
+
+/**
+ * Build an ASS subtitle document for the words inside [clipStart, clipEnd].
+ * Times are clip-relative: the first clip frame is 0.
+ */
+export function buildAss(transcript: Transcript, clipStart: number, clipEnd: number, options: CaptionOptions = {}): AssBuildResult {
+  const resolved = resolveCaptionOptions(options);
+  const inRange = flattenWords(transcript)
+    .filter(word => word.end > clipStart && word.start < clipEnd)
+    .map(word => ({ ...word, start: Math.max(0, word.start - clipStart), end: Math.max(0, word.end - clipStart), word: word.word.trim() }))
+    .filter(word => word.word.length > 0 && word.end > word.start);
+  const cards = buildCaptionCards(inRange, { maxWordsPerCard: resolved.maxWordsPerCard, maxGapSeconds: resolved.maxGapSeconds });
+  const warnings: string[] = [];
+  const keyword = hexToAssColor(resolved.keywordColor);
+  const white = hexToAssColor('#FFFFFF');
+
+  const events = cards.map(card => {
+    let cursor = card.start;
+    const keywordIndex = pickKeyword(card);
+    const text = card.words.map((word, index) => {
+      const gap = Math.max(0, word.start - cursor);
+      const duration = Math.max(0, word.end - word.start);
+      const lead = gap > 0.05 ? `{\\k${Math.round(gap * 100)}}` : '';
+      const syllable = `{\\k${Math.max(1, Math.round(duration * 100))}}`;
+      const highlighted = index === keywordIndex ? `{\\c${keyword}}${escapeAssText(word.word)}{\\c${white}}` : escapeAssText(word.word);
+      cursor = word.end;
+      return `${lead}${syllable}${highlighted}`;
+    }).join(' ');
+    const cps = card.end > card.start ? (card.words.map(word => word.word).join(' ').length / (card.end - card.start)) : 0;
+    if (cps > 20) warnings.push(`caption card at ${card.start.toFixed(2)}s reads at ${cps.toFixed(1)} CPS (>20).`);
+    return `Dialogue: 0,${formatAssTime(card.start)},${formatAssTime(card.end)},Caption,,0,0,0,,${text}`;
+  });
+
+  const ass = [
+    '[Script Info]',
+    'ScriptType: v4.00+',
+    'WrapStyle: 2',
+    'ScaledBorderAndShadow: yes',
+    `PlayResX: ${resolved.canvas.width}`,
+    `PlayResY: ${resolved.canvas.height}`,
+    '',
+    '[V4+ Styles]',
+    'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
+    `Style: Caption,${resolved.fontName},${resolved.fontSize},${white},&H00B4B4B4,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,${resolved.outline},2,2,${resolved.safeBox.marginLeft},${resolved.safeBox.marginRight},${resolved.safeBox.marginBottom},1`,
+    '',
+    '[Events]',
+    'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+    ...events,
+    '',
+  ].join('\n');
+  return { ass, cards, warnings };
+}
+
+export function buildLoudnormProbeArgs(inputPath: string, loudness: Required<LoudnessOptions>): string[] {
+  return [
+    '-hide_banner', '-nostdin', '-i', inputPath,
+    '-af', `loudnorm=I=${loudness.targetI}:TP=${loudness.targetTP}:LRA=${loudness.targetLRA}:print_format=json`,
+    '-f', 'null', '-',
+  ];
+}
+
+export function parseLoudnormOutput(stderr: string): LoudnormMeasurement | null {
+  const match = stderr.match(/\{[\s\S]*?"input_i"[\s\S]*?\}/);
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[0]) as Record<string, unknown>;
+    const numeric = (key: string): number | null => {
+      const value = parsed[key];
+      const number = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+      return Number.isFinite(number) ? number : null;
+    };
+    const input_i = numeric('input_i');
+    const input_tp = numeric('input_tp');
+    const input_lra = numeric('input_lra');
+    const input_thresh = numeric('input_thresh');
+    const target_offset = numeric('target_offset');
+    if (input_i === null || input_tp === null || input_lra === null || input_thresh === null || target_offset === null) return null;
+    return { input_i, input_tp, input_lra, input_thresh, target_offset };
+  } catch {
+    return null;
+  }
+}
+
+const escapeFilterPath = (path: string): string => path.replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'");
+
+export function ffmpegSubtitlesFilter(assPath: string): string {
+  return `subtitles=filename='${escapeFilterPath(assPath)}'`;
+}
+
+export function buildRenderArgs(request: { inputPath: string; outputPath: string; assPath?: string | null; reframeFilter?: string | null; loudness?: Required<LoudnessOptions>; measured?: LoudnormMeasurement | null }): string[] {
+  const args = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-i', request.inputPath];
+  const filters: string[] = [];
+  if (request.reframeFilter) filters.push(request.reframeFilter);
+  if (request.assPath) filters.push(ffmpegSubtitlesFilter(request.assPath));
+  if (filters.length) args.push('-vf', filters.join(','));
+  if (request.loudness?.enabled) {
+    const loud = request.loudness;
+    const measured = request.measured;
+    const measuredArgs = measured
+      ? `:measured_I=${measured.input_i}:measured_TP=${measured.input_tp}:measured_LRA=${measured.input_lra}:measured_thresh=${measured.input_thresh}:offset=${measured.target_offset}`
+      : '';
+    args.push('-af', `loudnorm=I=${loud.targetI}:TP=${loud.targetTP}:LRA=${loud.targetLRA}${measuredArgs}:linear=${loud.linear ? 'true' : 'false'}`);
+  }
+  args.push(
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
+    '-movflags', '+faststart', '-y', request.outputPath,
+  );
+  return args;
+}
+
+export function buildTightenArgs(inputPath: string, outputPath: string, options: Required<TightenOptions>): string[] {
+  return [
+    inputPath, '--output', outputPath,
+    '--edit', `audio:threshold=${options.threshold}`,
+    '--margin', `${options.marginSeconds}s`,
+  ];
+}
+
+function buildSidecar(request: RenderRequest, outputProbe: MediaProbe, stages: RenderStageReport, loudness: Required<LoudnessOptions>, ffmpegArgs: string[], now: () => number): RenderSidecar {
+  return {
+    campaignId: request.campaignId,
+    videoId: request.videoId,
+    inputPath: request.inputPath,
+    outputPath: request.outputPath,
+    clip: { start: request.clipStart, end: request.clipEnd, durationSeconds: Math.max(0, request.clipEnd - request.clipStart) },
+    stages,
+    loudnessTarget: { targetI: loudness.targetI, targetTP: loudness.targetTP, targetLRA: loudness.targetLRA },
+    render: { reencode: true, ffmpegArgs, outputProbe },
+    createdAt: new Date(now()).toISOString(),
+  };
+}
+
+export async function renderClip(request: RenderRequest, deps: RenderDeps = {}): Promise<RenderResult> {
+  const runner = deps.runner ?? defaultProcessRunner;
+  const ffmpeg = deps.ffmpegCommand ?? 'ffmpeg';
+  const probeCommand = deps.probeCommand ?? 'ffprobe';
+  const timeoutMs = deps.timeoutMs ?? 600_000;
+  const tolerance = deps.durationToleranceSeconds ?? 0.5;
+  const now = deps.now ?? Date.now;
+  const captions = resolveCaptionOptions(request.captions);
+  const loudness = resolveLoudnessOptions(request.loudness);
+  const tighten = resolveTightenOptions(request.tighten);
+  const reframe = resolveReframeOptions(request.reframe);
+  await mkdir(dirname(request.outputPath), { recursive: true });
+
+  if (!deps.refresh && (await stat(request.outputPath).catch(() => null))) {
+    try {
+      const probe = await probeMedia(request.outputPath, { command: probeCommand, runner, timeoutMs: 60_000 });
+      const expected = request.clipEnd - request.clipStart;
+      if (probe.durationSeconds > 0 && Math.abs(probe.durationSeconds - expected) <= tolerance) {
+        return {
+          outputPath: request.outputPath, sidecarPath: request.sidecarPath, assPath: null, probe, fromCache: true,
+          stages: { tighten: { ran: false, command: tighten.command, args: [], output: null, warning: null }, reframe: { ran: false, filter: null, focusX: reframe.focusX }, captions: { ran: false, path: null, cards: 0, warnings: [] }, loudness: { ran: false, measured: null } },
+        };
+      }
+    } catch { /* unreadable; re-render */ }
+  }
+
+  const stageReport: RenderStageReport = {
+    tighten: { ran: false, command: tighten.command, args: [], output: null, warning: null },
+    reframe: { ran: false, filter: null, focusX: reframe.focusX },
+    captions: { ran: false, path: null, cards: 0, warnings: [] },
+    loudness: { ran: false, measured: null },
+  };
+
+  let workingInput = request.inputPath;
+  if (tighten.enabled) {
+    const tightened = `${request.outputPath}.tightened.mp4`;
+    const args = buildTightenArgs(request.inputPath, tightened, tighten);
+    stageReport.tighten.args = args;
+    try {
+      const result = await runner(tighten.command, args, timeoutMs);
+      if (result.code === 0 && (await stat(tightened).catch(() => null))) {
+        workingInput = tightened;
+        stageReport.tighten.ran = true;
+        stageReport.tighten.output = tightened;
+      } else {
+        stageReport.tighten.warning = `${tighten.command} exited ${result.code}; keeping the untightened cut.`;
+      }
+    } catch (error) {
+      stageReport.tighten.warning = `${tighten.command} unavailable (${error instanceof Error ? error.message : String(error)}); keeping the untightened cut.`;
+    }
+  }
+
+  let assPath: string | null = null;
+  const canvas = { width: 0, height: 0 };
+  if (reframe.enabled) {
+    const inputProbe = await probeMedia(workingInput, { command: probeCommand, runner, timeoutMs: 60_000 }).catch(() => null);
+    const inputWidth = inputProbe?.width ?? 0;
+    const inputHeight = inputProbe?.height ?? 0;
+    const filter = buildReframeFilter(inputWidth, inputHeight, reframe);
+    stageReport.reframe = { ran: Boolean(filter), filter, focusX: reframe.focusX };
+    canvas.width = filter ? reframe.targetWidth : inputWidth || DEFAULT_CANVAS.width;
+    canvas.height = filter ? reframe.targetHeight : inputHeight || DEFAULT_CANVAS.height;
+  } else {
+    canvas.width = DEFAULT_CANVAS.width;
+    canvas.height = DEFAULT_CANVAS.height;
+  }
+  if (captions.enabled) {
+    const built = buildAss(request.transcript, request.clipStart, request.clipEnd, { ...request.captions, canvas });
+    stageReport.captions.cards = built.cards.length;
+    stageReport.captions.warnings = built.warnings;
+    if (built.cards.length) {
+      await mkdir(dirname(request.assPath), { recursive: true });
+      await writeFile(request.assPath, built.ass, 'utf8');
+      assPath = request.assPath;
+      stageReport.captions.ran = true;
+      stageReport.captions.path = request.assPath;
+    }
+  }
+
+  if (loudness.enabled) {
+    const probeArgs = buildLoudnormProbeArgs(workingInput, loudness);
+    const measuredRun = await runner(ffmpeg, probeArgs, timeoutMs);
+    if (measuredRun.code === 0) {
+      const measured = parseLoudnormOutput(measuredRun.stderr);
+      if (measured) { stageReport.loudness.ran = true; stageReport.loudness.measured = measured; }
+    }
+  }
+
+  const args = buildRenderArgs({ inputPath: workingInput, outputPath: request.outputPath, assPath, reframeFilter: stageReport.reframe.filter, loudness, measured: stageReport.loudness.measured });
+  const result = await runner(ffmpeg, args, timeoutMs);
+  if (result.code !== 0) {
+    throw new Error(`render ffmpeg failed (exit ${result.code}): ${result.stderr.trim().split('\n').slice(-3).join(' ').slice(0, 500) || 'no stderr'}`);
+  }
+  const probe = await probeMedia(request.outputPath, { command: probeCommand, runner, timeoutMs: 60_000 });
+  if (!(probe.durationSeconds > 0)) {
+    throw new Error(`render produced a zero-length clip at ${request.outputPath} (ffprobe duration ${probe.durationSeconds}).`);
+  }
+  const delta = Math.abs(probe.durationSeconds - (request.clipEnd - request.clipStart));
+  if (delta > tolerance) {
+    throw new Error(`Render duration mismatch: expected ${(request.clipEnd - request.clipStart).toFixed(3)}s, ffprobe reports ${probe.durationSeconds.toFixed(3)}s (delta ${delta.toFixed(3)}s > ${tolerance}s).`);
+  }
+  await writeFile(request.sidecarPath, JSON.stringify(buildSidecar(request, probe, stageReport, loudness, args, now), null, 2), 'utf8');
+  return { outputPath: request.outputPath, sidecarPath: request.sidecarPath, assPath, probe, stages: stageReport, fromCache: false };
+}
+
+export function renderOutputPaths(outDir: string, base: string): { outputPath: string; sidecarPath: string; assPath: string } {
+  return {
+    outputPath: join(outDir, `${base}.vertical.mp4`),
+    sidecarPath: join(outDir, `${base}.vertical.json`),
+    assPath: join(outDir, `${base}.vertical.ass`),
+  };
+}

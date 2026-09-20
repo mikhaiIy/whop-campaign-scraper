@@ -3,3 +3,8 @@ dist/
 .bb-brief/
 campaigns.config.md
 .env*
+.venv/
+.cache/
+bench/
+out/
+.scratch/

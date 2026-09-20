@@ -1,5 +1,8 @@
+import { createReadStream } from 'node:fs';
+import { stat } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { z } from 'zod';
+import { ClippingApi, isInsideClipRoot, runBodySchema } from './clippingApi.js';
 import { API_LIMITS } from './api.js';
 import { type ConfigStore, type ResolvedConfig } from './config.js';
 import { categoryCounts, filterSchema } from './filters.js';
@@ -19,6 +22,8 @@ export interface WebServerOptions {
   configStore: ConfigStore;
   toolLog: ToolLog;
   port?: number;
+  /** Omit to run the console without the clipping stages. */
+  clipping?: ClippingApi;
 }
 
 export interface WebServerHandle {
@@ -97,6 +102,7 @@ const sendJson = (response: ServerResponse, status: number, value: unknown): voi
 
 export function createWebServer(options: WebServerOptions): Server {
   const { source, configStore, toolLog } = options;
+  const clipping = options.clipping ?? null;
 
   const applyFetchConfig = async () => {
     const config = await configStore.get();
@@ -170,6 +176,10 @@ export function createWebServer(options: WebServerOptions): Server {
       sendJson(response, 200, { refreshed: true, ...data, status: await status() });
       return;
     }
+    if (path.startsWith('/api/clipping/') || path.startsWith('/clips/')) {
+      if (!clipping) { sendJson(response, 503, { error: 'The clipping stages are not enabled on this server.' }); return; }
+      if (await handleClipping(clipping, path, method, url, request, response)) return;
+    }
     sendJson(response, 404, { error: `No route for ${method} ${path}` });
   };
 
@@ -183,6 +193,104 @@ export function createWebServer(options: WebServerOptions): Server {
       else response.end();
     });
   });
+}
+
+const STAGE_STARTERS = {
+  brief: (api: ClippingApi, body: ReturnType<typeof runBodySchema.parse>) => api.crawlBrief(body),
+  extract: (api: ClippingApi, body: ReturnType<typeof runBodySchema.parse>) => api.extractSpec(body),
+  footage: (api: ClippingApi, body: ReturnType<typeof runBodySchema.parse>) => api.resolveFootage(body),
+  moments: (api: ClippingApi, body: ReturnType<typeof runBodySchema.parse>) => api.selectMoments(body),
+  clips: (api: ClippingApi, body: ReturnType<typeof runBodySchema.parse>) => api.produceClips(body),
+} as const;
+
+async function handleClipping(
+  api: ClippingApi,
+  path: string,
+  method: string,
+  url: URL,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<boolean> {
+  if (path === '/api/clipping/view' && method === 'GET') {
+    const campaignId = url.searchParams.get('campaignId');
+    if (!campaignId) { sendJson(response, 400, { error: 'Pass a campaignId.' }); return true; }
+    sendJson(response, 200, api.view(campaignId));
+    return true;
+  }
+
+  if (path === '/api/clipping/job' && method === 'GET') {
+    const id = url.searchParams.get('id');
+    if (!id) { sendJson(response, 400, { error: 'Pass a job id.' }); return true; }
+    const job = api.job(id);
+    if (!job) { sendJson(response, 404, { error: 'No job has that id.' }); return true; }
+    sendJson(response, 200, job);
+    return true;
+  }
+
+  if (path === '/api/clipping/cancel' && method === 'POST') {
+    const body = JSON.parse(await readBody(request)) as { id?: string };
+    if (!body.id) { sendJson(response, 400, { error: 'Pass a job id.' }); return true; }
+    sendJson(response, 200, { cancelled: api.cancel(body.id) });
+    return true;
+  }
+
+  const runMatch = /^\/api\/clipping\/run\/(brief|extract|footage|moments|clips)$/.exec(path);
+  if (runMatch && method === 'POST') {
+    const parsed = runBodySchema.safeParse(JSON.parse(await readBody(request)));
+    if (!parsed.success) {
+      sendJson(response, 400, { error: 'Invalid request.', issues: parsed.error.issues.map(issue => `${issue.path.join('.') || '(root)'}: ${issue.message}`) });
+      return true;
+    }
+    const stage = runMatch[1] as keyof typeof STAGE_STARTERS;
+    try {
+      const job = STAGE_STARTERS[stage](api, parsed.data);
+      sendJson(response, 202, { job });
+    } catch (error) {
+      sendJson(response, 409, { error: error instanceof Error ? error.message : String(error) });
+    }
+    return true;
+  }
+
+  if (path === '/api/clipping/sidecar' && method === 'GET') {
+    const target = url.searchParams.get('path');
+    if (!target) { sendJson(response, 400, { error: 'Pass a path.' }); return true; }
+    try {
+      sendJson(response, 200, await api.sidecar(target));
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
+    }
+    return true;
+  }
+
+  if (path === '/clips/media' && method === 'GET') {
+    const target = url.searchParams.get('path');
+    if (!target || !isInsideClipRoot(target)) { sendJson(response, 400, { error: 'That path is outside out/clips.' }); return true; }
+    let size: number;
+    try { size = (await stat(target)).size; } catch { sendJson(response, 404, { error: 'No file is at that path.' }); return true; }
+    const range = /^bytes=(\d*)-(\d*)$/.exec(request.headers.range ?? '');
+    if (range) {
+      const start = range[1] ? Number(range[1]) : 0;
+      const end = range[2] ? Number(range[2]) : size - 1;
+      if (start >= size || end >= size || start > end) {
+        response.writeHead(416, { 'Content-Range': `bytes */${size}` });
+        response.end();
+        return true;
+      }
+      response.writeHead(206, {
+        'Content-Type': 'video/mp4',
+        'Content-Length': end - start + 1,
+        'Content-Range': `bytes ${start}-${end}/${size}`,
+        'Accept-Ranges': 'bytes',
+      });
+      createReadStream(target, { start, end }).pipe(response);
+      return true;
+    }
+    response.writeHead(200, { 'Content-Type': 'video/mp4', 'Content-Length': size, 'Accept-Ranges': 'bytes' });
+    createReadStream(target).pipe(response);
+    return true;
+  }
+
+  return false;
 }
 
 export async function startWebServer(options: WebServerOptions): Promise<WebServerHandle> {

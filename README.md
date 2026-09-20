@@ -62,6 +62,41 @@ the first rendered batch. See [Deep fetching](#deep-fetching-pagination).
 
 ---
 
+## Clipping pipeline
+
+The server also turns a campaign's footage into vertical, captioned clips — still
+fully local, with no account or API key. One-time setup:
+
+```bash
+bash tools/setup-whisper.sh     # .venv: faster-whisper (transcription) + auto-editor (tighten)
+```
+
+This needs system `ffmpeg`/`ffprobe` built with `libass` and `loudnorm`.
+
+| Tool | Purpose |
+| --- | --- |
+| `get_campaign_brief` | Crawl the brief into a BriefBundle. |
+| `extract_clip_spec` | Extract a typed ClipSpec (durations, hook policy, forbidden rules). |
+| `resolve_campaign_footage` | Resolve YouTube channels / Drive folders to source videos. |
+| `plan_campaign_clips` | Crawl + spec + footage — the front half, no cutting. |
+| `select_campaign_moments` | Transcribe and pick clip-worthy moments; cuts nothing. |
+| `produce_campaign_clips` | Cut real clips. Set `enhance: true` for the rendered vertical short. |
+
+**Moment selection** ranks candidates by a hook score, drops overlapping or
+near-duplicate picks (IoU > 0.5, bag-of-words cosine > 0.85), gates out weak
+openings, re-scores the shortlist in a second model pass, then applies MMR
+diversity (λ = 0.7) so one batch is not five versions of the same moment.
+
+**The render stage** (`enhance: true`) tightens dead air with auto-editor,
+reframes to 1080×1920 (scale-to-cover, then crop), burns word-synced ASS captions
+authored for the output canvas, and normalizes audio to −14 LUFS / −1.5 dBTP /
+LRA 11 in a single ffmpeg pass. Each render writes a sidecar
+(`<clip>.vertical.json`) with the measured loudness, the exact ffmpeg args and
+the output probe. The console exposes the same path as a **Vertical + captions**
+toggle.
+
+---
+
 ## Harness wiring
 
 All three harnesses launch the same stdio server:

@@ -1,3 +1,5 @@
+import { CLIPPING_CSS, CLIPPING_HTML, CLIPPING_JS } from './clippingUi.js';
+
 export const PAGE_HTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -161,6 +163,7 @@ td.title{min-width:230px}
 #tooltip .tt-val{font-weight:650;color:var(--ink)}
 #tooltip .tt-label{color:var(--muted);font-size:11px}
 .loading main{opacity:.6}
+${CLIPPING_CSS}
 </style>
 </head>
 <body>
@@ -223,6 +226,7 @@ td.title{min-width:230px}
     </section>
   </div>
 </main>
+${CLIPPING_HTML}
 <div id="tooltip" role="tooltip" hidden></div>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script>
@@ -531,6 +535,11 @@ function renderTable(){
   }
   rows.forEach(function(c){
     var tr=document.createElement('tr');
+    tr.className='row-open';tr.tabIndex=0;
+    tr.setAttribute('role','button');
+    tr.setAttribute('aria-label','Open the clipping console for '+(c.title||c.id));
+    tr.addEventListener('click',function(){openClip(c.id,c.title);});
+    tr.addEventListener('keydown',function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();openClip(c.id,c.title);}});
     var tdTitle=document.createElement('td');tdTitle.className='title';tdTitle.appendChild(thumbCell(c));tr.appendChild(tdTitle);
     tr.appendChild(el('td',null,c.category));
     tr.appendChild(el('td',null,c.type||'—'));
@@ -793,6 +802,7 @@ $('theme').addEventListener('click',function(){
     $('theme').setAttribute('aria-pressed',saved==='dark'?'true':'false');
     $('theme').textContent=saved==='dark'?'Light mode':'Dark mode';}
 })();
+${CLIPPING_JS}
 load();
 </script>
 </body>
