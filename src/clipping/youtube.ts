@@ -19,6 +19,44 @@ export interface ChannelListing {
   warnings: string[];
 }
 
+const CLIP_POSITIVE = [
+  /\breacts?\b/i, /\breaction\b/i, /\blive\b/i, /\bstream\b/i, /\bpodcast\b/i, /\binterview\b/i,
+  /\bhighlights?\b/i, /\bcompilation\b/i, /\bfunny\b/i, /\bmoments?\b/i, /\bgameplay\b/i,
+  /\bchat\b/i, /\bargument\b/i, /\bdrama\b/i, /\btier list\b/i, /\bvs\b/i,
+];
+
+const CLIP_NEGATIVE = [
+  /\btips?\b/i, /\bhow to\b/i, /\bguide\b/i, /\btutorial\b/i, /\bexplained\b/i,
+  /\bfor beginners\b/i, /\blessons?\b/i, /\bmotivation\b/i, /\bannouncement\b/i, /\bq&a\b/i,
+];
+
+export interface ClippabilityScore {
+  score: number;
+  reasons: string[];
+}
+
+/**
+ * Heuristic clippability of a source video from its title and length.
+ * Reaction, livestream and podcast footage clips far better than tutorials,
+ * explainers and long monologues, so rank footage with this before downloading.
+ */
+export function clippabilityScore(video: SourceVideo): ClippabilityScore {
+  const title = video.title ?? '';
+  const reasons: string[] = [];
+  let score = 0;
+  for (const pattern of CLIP_POSITIVE) if (pattern.test(title)) { score += 2; reasons.push(`+ ${pattern.source}`); }
+  for (const pattern of CLIP_NEGATIVE) if (pattern.test(title)) { score -= 2; reasons.push(`- ${pattern.source}`); }
+  if (video.durationSeconds !== null) {
+    if (video.durationSeconds <= 300) { score += 1; reasons.push('+ short (<=5 min)'); }
+    else if (video.durationSeconds >= 3600) { score -= 1; reasons.push('- very long (>=1 h)'); }
+  }
+  return { score, reasons };
+}
+
+export function rankFootage(videos: SourceVideo[]): SourceVideo[] {
+  return [...videos].sort((a, b) => clippabilityScore(b).score - clippabilityScore(a).score || (b.viewCount ?? 0) - (a.viewCount ?? 0));
+}
+
 export interface ProcessResult {
   stdout: string;
   stderr: string;

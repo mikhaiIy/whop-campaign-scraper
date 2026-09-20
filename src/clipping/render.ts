@@ -32,6 +32,8 @@ export interface CaptionOptions {
   enabled?: boolean;
   maxWordsPerCard?: number;
   maxGapSeconds?: number;
+  /** Minimum on-screen time per card; short cards are merged or held. */
+  minCardSeconds?: number;
   fontName?: string;
   fontSize?: number;
   keywordColor?: string;
@@ -133,6 +135,7 @@ export interface ResolvedCaptionOptions {
   enabled: boolean;
   maxWordsPerCard: number;
   maxGapSeconds: number;
+  minCardSeconds: number;
   fontName: string;
   fontSize: number;
   keywordColor: string;
@@ -160,8 +163,9 @@ export function resolveCaptionOptions(options: CaptionOptions = {}): ResolvedCap
   const fontAtCanvas = options.fontSize ?? Math.round((72 * canvas.height) / DEFAULT_CANVAS.height);
   return {
     enabled: options.enabled ?? true,
-    maxWordsPerCard: Math.max(1, Math.min(6, Math.round(asNumber(options.maxWordsPerCard, 2)))),
+    maxWordsPerCard: Math.max(1, Math.min(6, Math.round(asNumber(options.maxWordsPerCard, 3)))),
     maxGapSeconds: asNumber(options.maxGapSeconds, 0.7),
+    minCardSeconds: Math.max(0, asNumber(options.minCardSeconds, 0.4)),
     fontName: options.fontName ?? 'DejaVu Sans',
     fontSize: Math.max(24, Math.min(200, Math.round(asNumber(fontAtCanvas, 72)))),
     keywordColor: options.keywordColor ?? '#FFE500',
@@ -302,9 +306,10 @@ export interface CaptionCard {
 }
 
 /** Group clip-relative words into caption cards of at most `maxWordsPerCard`, splitting on long pauses. */
-export function buildCaptionCards(words: WordTiming[], options: { maxWordsPerCard?: number; maxGapSeconds?: number } = {}): CaptionCard[] {
-  const maxWords = Math.max(1, options.maxWordsPerCard ?? 2);
+export function buildCaptionCards(words: WordTiming[], options: { maxWordsPerCard?: number; maxGapSeconds?: number; minDurationSeconds?: number } = {}): CaptionCard[] {
+  const maxWords = Math.max(1, options.maxWordsPerCard ?? 3);
   const maxGap = options.maxGapSeconds ?? 0.7;
+  const minDuration = Math.max(0, options.minDurationSeconds ?? 0);
   const cards: CaptionCard[] = [];
   let current: WordTiming[] = [];
   const flush = (): void => {
@@ -321,7 +326,25 @@ export function buildCaptionCards(words: WordTiming[], options: { maxWordsPerCar
     current.push(word);
   }
   flush();
-  return cards;
+  if (minDuration <= 0) return cards;
+
+  const merged: CaptionCard[] = [];
+  for (const card of cards) {
+    const last = merged[merged.length - 1];
+    if (last && last.end - last.start < minDuration && last.words.length + card.words.length <= maxWords) {
+      last.end = card.end;
+      last.words = [...last.words, ...card.words];
+    } else {
+      merged.push({ start: card.start, end: card.end, words: [...card.words] });
+    }
+  }
+  for (let index = 0; index < merged.length; index++) {
+    const card = merged[index];
+    if (card.end - card.start >= minDuration) continue;
+    const limit = merged[index + 1] ? merged[index + 1].start : Number.POSITIVE_INFINITY;
+    card.end = Math.min(Math.max(card.end, card.start + minDuration), limit);
+  }
+  return merged;
 }
 
 export interface AssBuildResult {
@@ -350,7 +373,7 @@ export function buildAss(transcript: Transcript, clipStart: number, clipEnd: num
     .filter(word => word.end > clipStart && word.start < clipEnd)
     .map(word => ({ ...word, start: Math.max(0, word.start - clipStart), end: Math.max(0, word.end - clipStart), word: word.word.trim() }))
     .filter(word => word.word.length > 0 && word.end > word.start);
-  const cards = buildCaptionCards(inRange, { maxWordsPerCard: resolved.maxWordsPerCard, maxGapSeconds: resolved.maxGapSeconds });
+  const cards = buildCaptionCards(inRange, { maxWordsPerCard: resolved.maxWordsPerCard, maxGapSeconds: resolved.maxGapSeconds, minDurationSeconds: resolved.minCardSeconds });
   const warnings: string[] = [];
   const keyword = hexToAssColor(resolved.keywordColor);
   const white = hexToAssColor('#FFFFFF');

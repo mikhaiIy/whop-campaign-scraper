@@ -3,7 +3,7 @@ import { buildExtractionPrompt, emptyClipSpec, parseClipSpec, EXTRACTION_PROMPT_
 import type { BrowserRunner, DriveFile } from './browser.js';
 import type { TextLlm } from './llm.js';
 import { classifyReferences, type ClassifiedLink } from './links.js';
-import { YouTubeFootageResolver, normalizeChannelUrl, type ChannelListing, type SourceVideo } from './youtube.js';
+import { YouTubeFootageResolver, clippabilityScore, normalizeChannelUrl, rankFootage, type ChannelListing, type SourceVideo } from './youtube.js';
 
 export interface CampaignDetailLike {
   id: string;
@@ -134,7 +134,12 @@ export class ClippingPipeline {
         videos.push(video);
       }
     }
-    return { channels, videos, driveFiles, deferred, warnings };
+    const ranked = rankFootage(videos);
+    if (ranked.length) {
+      const best = clippabilityScore(ranked[0]);
+      warnings.push(`Footage ranked by clippability; best candidate is "${ranked[0].title}" (score ${best.score}).`);
+    }
+    return { channels, videos: ranked, driveFiles, deferred, warnings };
   }
 
   async plan(detail: CampaignDetailLike, options: PlanOptions = {}): Promise<ClippingPlan> {

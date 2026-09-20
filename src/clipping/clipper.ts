@@ -5,9 +5,10 @@ import type { ClipSpec } from './extract.js';
 import type { TextLlm } from './llm.js';
 import { MediaCache, type MediaAsset, type SectionRange } from './media.js';
 import {
-  selectMoments, snapCandidate, specProvenanceFor, transcriptExcerpt,
+  selectMoments, snapCandidate, specProvenanceFor, transcriptExcerpt, refineHookStart,
   type Assumption, type MomentCandidate, type MomentSelection, type MomentSelectionOptions, type SnapOptions, type SnapResult,
 } from './moments.js';
+import { collectSignals, sourcePotential, type MediaSignals, type SourcePotential } from './signals.js';
 import { renderClip, renderOutputPaths, type CaptionOptions, type LoudnessOptions, type RenderResult, type TightenOptions } from './render.js';
 import { TranscriptionCache, flattenWords, shiftTranscript, transcriptDuration, type Transcript } from './transcribe.js';
 import type { ProcessRunner } from './youtube.js';
@@ -32,7 +33,9 @@ export interface PreparedMoments {
   transcript: Transcript;
   selection: MomentSelection;
   assumptions: Assumption[];
-  candidates: { candidate: MomentCandidate; snap: SnapResult }[];
+  candidates: { candidate: MomentCandidate; snap: SnapResult; hookRefine: { start: number; moved: boolean; reason: string } }[];
+  signals: MediaSignals;
+  potential: SourcePotential;
   warnings: string[];
 }
 
@@ -63,7 +66,7 @@ export interface AssembleResult {
   sourceUrl: string;
   audio: { path: string; durationSeconds: number; fromCache: boolean; section: SectionRange | null };
   transcript: { model: string; language: string | null; segments: number; words: number; offsetSeconds: number; durationSeconds: number };
-  selection: { candidates: number; windows: number; model: MomentSelection['model']; assumptions: Assumption[] };
+  selection: { candidates: number; windows: number; model: MomentSelection['model']; assumptions: Assumption[]; potential: SourcePotential };
   clips: ClipArtifact[];
   warnings: string[];
 }
@@ -123,11 +126,22 @@ export class ClipAssembler {
     const audio = await this.media.ingestAudio(video, { section: options.audioSection, refresh: options.refreshAudio });
     const raw = await this.transcriber.transcribe(audio, { refresh: options.refreshTranscript, model: options.transcriptModel });
     const transcript = shiftTranscript(raw, audio.section?.start ?? 0);
-    const selection = await selectMoments(this.llm, transcript, spec, options);
-    const candidates = selection.candidates.map(candidate => ({ candidate, snap: snapCandidate(candidate, transcript, options.snap) }));
+    const signals = await collectSignals(audio.path, { runner: this.runner, ffmpegCommand: this.ffmpegCommand });
+    const selection = await selectMoments(this.llm, transcript, spec, { ...options, signals });
+    const candidates = selection.candidates.map(candidate => {
+      const snap = snapCandidate(candidate, transcript, options.snap);
+      const hookRefine = refineHookStart({ ...candidate, start: snap.start }, transcript, signals);
+      const refinedSnap = hookRefine.moved ? snapCandidate({ start: hookRefine.start, end: snap.end }, transcript, options.snap) : snap;
+      return { candidate, snap: refinedSnap, hookRefine };
+    });
     const warnings = [...selection.warnings];
-    for (const item of candidates) warnings.push(...item.snap.warnings.map(warning => `candidate ${item.candidate.start.toFixed(1)}s: ${warning}`));
-    return { videoId: video.id, sourceUrl, audio, transcript, selection, assumptions: selection.assumptions, candidates, warnings };
+    const potential = sourcePotential(signals);
+    if (potential.level === 'low') warnings.push(`Source audio looks flat (${potential.reason}); clips from it are unlikely to feel energetic.`);
+    for (const item of candidates) {
+      warnings.push(...item.snap.warnings.map(warning => `candidate ${item.candidate.start.toFixed(1)}s: ${warning}`));
+      if (item.hookRefine.moved) warnings.push(`candidate ${item.candidate.start.toFixed(1)}s: ${item.hookRefine.reason}.`);
+    }
+    return { videoId: video.id, sourceUrl, audio, transcript, selection, assumptions: selection.assumptions, candidates, signals, potential, warnings };
   }
 
   async assemble(video: ClipVideo, spec: ClipSpec, options: AssembleOptions = {}): Promise<AssembleResult> {
@@ -211,13 +225,14 @@ export class ClipAssembler {
       }
     }
 
+    if (!clips.length) warnings.push(`No clip-worthy moments survived selection for ${video.id}; source potential is ${prepared.potential.level}.`);
     return {
       campaignId: this.campaignId,
       videoId: video.id,
       sourceUrl: prepared.sourceUrl,
       audio: { path: prepared.audio.path, durationSeconds: prepared.audio.probe.durationSeconds, fromCache: prepared.audio.fromCache, section: prepared.audio.section },
       transcript: { model: prepared.transcript.model, language: prepared.transcript.language, segments: prepared.transcript.segments.length, words: flattenWords(prepared.transcript).length, offsetSeconds: prepared.transcript.offsetSeconds, durationSeconds: duration },
-      selection: { candidates: prepared.candidates.length, windows: prepared.selection.windows, model: prepared.selection.model, assumptions: prepared.assumptions },
+      selection: { candidates: prepared.candidates.length, windows: prepared.selection.windows, model: prepared.selection.model, assumptions: prepared.assumptions, potential: prepared.potential },
       clips,
       warnings,
     };

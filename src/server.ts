@@ -174,11 +174,16 @@ export function createServer(source = new CampaignSource(), configStore = new Co
     captions: clip.render ? { cards: clip.render.stages.captions.cards, warnings: clip.render.stages.captions.warnings } : null,
     loudness: clip.render?.stages.loudness.measured ?? null,
     hookRating: clip.candidate.hookRating,
+    momentType: clip.candidate.momentType ?? null,
+    hookLine: clip.candidate.hookLine ?? null,
+    payoffLine: clip.candidate.payoffLine ?? null,
+    viralityScore: clip.candidate.viralityScore ?? null,
+    audioEnergyDb: clip.candidate.audioEnergyDb ?? null,
     reason: clip.candidate.reason,
     rulesChecked: clip.candidate.rulesChecked,
   }));
   server.registerTool('select_campaign_moments', {
-    description: 'Ingest a source video\'s audio only, transcribe it locally with word-level timings, and run the local model over the transcript to pick clip-worthy moments. Returns candidates with raw and word-snapped bounds, the rules each candidate was checked against, the ClipSpec duration assumption used, and every warning. No files are cut; use produce_campaign_clips to cut.',
+    description: 'Ingest a source video\'s audio only, transcribe it locally with word-level timings, and run the local model over the transcript to pick clip-worthy moments. Detection is fused with local audio-energy and scene-cut signals, and each candidate is scored for virality (moment type, hook, payoff, self-containment); context-dependent or payoff-less spans are rejected. Also reports the source\'s hype potential. Returns candidates with raw and word-snapped bounds, the rules each candidate was checked against, the ClipSpec duration assumption used, and every warning. No files are cut; use produce_campaign_clips to cut.',
     inputSchema: { id: z.string().uuid(), video_id: z.string().trim().min(1), refresh: z.boolean().optional(), duration_min: z.number().positive().optional(), duration_max: z.number().positive().optional() }, annotations: writeAnnotations,
   }, args => result('select_campaign_moments', args, async () => {
     const { id, video_id, refresh, duration_min, duration_max } = args as { id: string; video_id: string; refresh?: boolean; duration_min?: number; duration_max?: number };
@@ -201,16 +206,18 @@ export function createServer(source = new CampaignSource(), configStore = new Co
       briefWarnings: bundle.warnings, extractionWarnings,
       audio: { path: prepared.audio.path, durationSeconds: prepared.audio.probe.durationSeconds, fromCache: prepared.audio.fromCache, section: prepared.audio.section },
       transcript: { model: prepared.transcript.model, language: prepared.transcript.language, segments: prepared.transcript.segments.length, words: prepared.transcript.segments.reduce((total, segment) => total + segment.words.length, 0), offsetSeconds: prepared.transcript.offsetSeconds, durationSeconds: prepared.transcript.durationSeconds },
-      candidates: prepared.candidates.map(item => ({ ...item.candidate, snappedStart: item.snap.start, snappedEnd: item.snap.end, startAdjustmentSeconds: item.snap.startAdjustmentSeconds, endAdjustmentSeconds: item.snap.endAdjustmentSeconds })),
+      candidates: prepared.candidates.map(item => ({ ...item.candidate, snappedStart: item.snap.start, snappedEnd: item.snap.end, startAdjustmentSeconds: item.snap.startAdjustmentSeconds, endAdjustmentSeconds: item.snap.endAdjustmentSeconds, hookRefine: item.hookRefine })),
       assumptions: prepared.assumptions,
       selectionModel: prepared.selection.model,
       windows: prepared.selection.windows,
+      sourcePotential: prepared.potential,
+      audioEnergy: { medianLoudnessDb: prepared.signals.medianLoudness, dynamicRangeDb: prepared.signals.dynamicRangeDb, loudWindows: prepared.signals.loudPeaks.length, sceneCutClusters: prepared.signals.cutDense.length },
       warnings: [...warnings, ...prepared.warnings],
       contentTrust: bundle.contentTrust, clippingNote: CLIPPING_NOTE,
     };
   }));
   server.registerTool('produce_campaign_clips', {
-    description: 'Cut real clip files: ingest audio, transcribe, select moments, download only the video sections around the chosen moments, snap the bounds to word timings, and re-encode each clip with ffmpeg. Verifies every output duration with ffprobe and writes a sidecar JSON per clip with both source-absolute and section-relative timecodes, the word-level transcript excerpt, the rule provenance, and the stated duration assumption. Set enhance=true to also render a vertical 1080x1920 deliverable with burned word-synced captions and -14 LUFS loudness normalization.',
+    description: 'Cut real clip files: ingest audio, transcribe, select moments (fused with audio-energy and scene-cut signals, with a payoff requirement and a hook start), download only the video sections around the chosen moments, snap the bounds to word timings, and re-encode each clip with ffmpeg. Verifies every output duration with ffprobe and writes a sidecar JSON per clip with both source-absolute and section-relative timecodes, the word-level transcript excerpt, the rule provenance, and the stated duration assumption. Set enhance=true to also render a vertical 1080x1920 deliverable with burned word-synced captions and -14 LUFS loudness normalization.',
     inputSchema: { id: z.string().uuid(), video_id: z.string().trim().min(1), limit: z.number().int().min(1).max(20).optional(), out_dir: z.string().trim().min(1).optional(), padding_seconds: z.number().min(0).max(30).optional(), enhance: z.boolean().optional(), refresh: z.boolean().optional() }, annotations: writeAnnotations,
   }, args => result('produce_campaign_clips', args, async () => {
     const { id, video_id, limit, out_dir, padding_seconds, enhance, refresh } = args as { id: string; video_id: string; limit?: number; out_dir?: string; padding_seconds?: number; enhance?: boolean; refresh?: boolean };
