@@ -1,3 +1,5 @@
+import { mkdir, stat, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { defaultProcessRunner, type ProcessRunner } from './youtube.js';
 
 /**
@@ -22,6 +24,12 @@ export interface MotionSample {
   motion: number;
 }
 
+export interface EmotionSample {
+  t: number;
+  emotion: string | null;
+  confidence: number;
+}
+
 export interface MediaSignals {
   durationSeconds: number;
   loudness: LoudnessSample[];
@@ -31,6 +39,9 @@ export interface MediaSignals {
   /** Frame-difference energy (visual activity), when a video source was probed. */
   motion: MotionSample[];
   visualPeaks: TimeRange[];
+  /** Facial-expression samples and their peaks, when the FER model was available. */
+  emotion: EmotionSample[];
+  emotionPeaks: TimeRange[];
   /** Chat-velocity spikes, when a live-chat replay was available. */
   chatSpikes: TimeRange[];
   medianLoudness: number;
@@ -41,7 +52,16 @@ export interface SignalDeps {
   runner?: ProcessRunner;
   ffmpegCommand?: string;
   timeoutMs?: number;
+  pythonPath?: string;
+  emotionScript?: string;
+  emotionModelPath?: string;
+  emotionModelUrl?: string;
+  emotionSamples?: number;
+  emotionEverySeconds?: number;
+  emotionTimeoutMs?: number;
 }
+
+export const DEFAULT_EMOTION_MODEL_URL = 'https://github.com/onnx/models/raw/main/validated/vision/body_analysis/emotion_ferplus/model/emotion-ferplus-8.onnx';
 
 export interface PeakOptions {
   /** dB above the median that counts as an emotional burst. */
@@ -64,6 +84,8 @@ export const EMPTY_SIGNALS: MediaSignals = {
   cutDense: [],
   motion: [],
   visualPeaks: [],
+  emotion: [],
+  emotionPeaks: [],
   chatSpikes: [],
   medianLoudness: -70,
   dynamicRangeDb: 0,
@@ -219,7 +241,7 @@ export interface SourcePotential {
 export function sourcePotential(signals: MediaSignals): SourcePotential {
   const range = signals.dynamicRangeDb;
   const peaks = signals.loudPeaks;
-  const extra = (signals.visualPeaks?.length ?? 0) + (signals.chatSpikes?.length ?? 0);
+  const extra = (signals.visualPeaks?.length ?? 0) + (signals.emotionPeaks?.length ?? 0) + (signals.chatSpikes?.length ?? 0);
   if ((range >= 10 && peaks.length >= 2) || extra >= 6) {
     return { level: 'high', dynamicRangeDb: range, peakSeconds: peaks, reason: `dynamic range ${range.toFixed(1)} dB, ${peaks.length} loud and ${extra} visual/chat window(s)` };
   }
@@ -267,29 +289,110 @@ export async function collectSignals(inputPath: string, deps: SignalDeps = {}, o
     cutDense: cutDensity(sceneCuts),
     motion,
     visualPeaks: motionPeaks(motion),
+    emotion: [],
+    emotionPeaks: [],
     chatSpikes: [],
     medianLoudness,
     dynamicRangeDb,
   };
 }
 
-/** Combine loudness (from audio) with visual and chat signals (from video/chat). */
-export function mergeSignals(audio: MediaSignals, video?: MediaSignals | null, chatSpikes: TimeRange[] = []): MediaSignals {
-  if (!video && !chatSpikes.length) return audio;
+/** Parse the JSON emitted by tools/emotion.py. */
+export function parseEmotionOutput(stdout: string): { samples: EmotionSample[]; frames: number } | null {
+  const match = stdout.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[0]) as { samples?: unknown; frames?: unknown };
+    const list = Array.isArray(parsed.samples) ? parsed.samples : [];
+    const samples: EmotionSample[] = [];
+    for (const entry of list) {
+      if (typeof entry !== 'object' || entry === null) continue;
+      const record = entry as Record<string, unknown>;
+      const t = Number(record.t);
+      if (!Number.isFinite(t)) continue;
+      const emotion = typeof record.emotion === 'string' ? record.emotion : null;
+      const confidence = Number(record.confidence);
+      samples.push({ t, emotion, confidence: Number.isFinite(confidence) ? confidence : 0 });
+    }
+    return { samples, frames: typeof parsed.frames === 'number' ? parsed.frames : samples.length };
+  } catch {
+    return null;
+  }
+}
+
+/** Runs of strong non-neutral expressions, as time ranges. */
+export function emotionPeaks(samples: EmotionSample[], options: { minConfidence?: number; minDurSec?: number; mergeGapSec?: number } = {}): TimeRange[] {
+  const minConfidence = options.minConfidence ?? 0.6;
+  const minDurSec = options.minDurSec ?? 1;
+  const mergeGapSec = options.mergeGapSec ?? 4;
+  const strong = samples.filter(sample => sample.emotion && sample.emotion !== 'neutral' && sample.confidence >= minConfidence);
+  if (strong.length < 2) return [];
+  const times = samples.map(sample => sample.t).sort((a, b) => a - b);
+  const spacing = times.length > 1 ? (times[times.length - 1] - times[0]) / (times.length - 1) : 1;
+  const half = Math.max(0.5, spacing / 2);
+  const ranges = strong.map(sample => ({ start: Math.max(0, sample.t - half), end: sample.t + half })).sort((a, b) => a.start - b.start);
+  const merged: TimeRange[] = [];
+  for (const range of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && range.start <= last.end + mergeGapSec) last.end = Math.max(last.end, range.end);
+    else merged.push({ ...range });
+  }
+  return merged.filter(range => range.end - range.start >= minDurSec);
+}
+
+async function ensureFile(url: string, path: string): Promise<boolean> {
+  if (await stat(path).catch(() => null)) return true;
+  try {
+    await mkdir(dirname(path), { recursive: true });
+    const response = await fetch(url);
+    if (!response.ok) return false;
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length < 1_000_000) return false;
+    await writeFile(path, buffer);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Sample facial expressions with the FER+ ONNX model; fail-open to empty. */
+export async function collectEmotionSignals(videoPath: string, deps: SignalDeps = {}): Promise<{ samples: EmotionSample[]; peaks: TimeRange[] }> {
+  const runner = deps.runner ?? defaultProcessRunner;
+  const python = deps.pythonPath ?? join(process.cwd(), '.venv/bin/python');
+  const script = deps.emotionScript ?? join(process.cwd(), 'tools/emotion.py');
+  const model = deps.emotionModelPath ?? join(process.cwd(), '.cache/clipping/models/emotion-ferplus-8.onnx');
+  if (!(await stat(python).catch(() => null)) || !(await stat(script).catch(() => null))) return { samples: [], peaks: [] };
+  if (!(await ensureFile(deps.emotionModelUrl ?? DEFAULT_EMOTION_MODEL_URL, model))) return { samples: [], peaks: [] };
+  try {
+    const result = await runner(python, [script, videoPath, '--model', model, '--samples', String(deps.emotionSamples ?? 24), '--every-seconds', String(deps.emotionEverySeconds ?? 3)], deps.emotionTimeoutMs ?? 600_000);
+    if (result.code !== 0) return { samples: [], peaks: [] };
+    const parsed = parseEmotionOutput(result.stdout);
+    if (!parsed) return { samples: [], peaks: [] };
+    return { samples: parsed.samples, peaks: emotionPeaks(parsed.samples) };
+  } catch {
+    return { samples: [], peaks: [] };
+  }
+}
+
+/** Combine loudness (from audio) with visual, emotion and chat signals. */
+export function mergeSignals(audio: MediaSignals, video?: MediaSignals | null, chatSpikes: TimeRange[] = [], emotion?: { samples: EmotionSample[]; peaks: TimeRange[] } | null): MediaSignals {
+  if (!video && !chatSpikes.length && !emotion) return audio;
   return {
     ...audio,
     sceneCuts: video?.sceneCuts ?? audio.sceneCuts,
     cutDense: video?.cutDense ?? audio.cutDense,
     motion: video?.motion ?? audio.motion,
     visualPeaks: video?.visualPeaks ?? audio.visualPeaks,
+    emotion: emotion?.samples ?? video?.emotion ?? audio.emotion,
+    emotionPeaks: emotion?.peaks ?? video?.emotionPeaks ?? audio.emotionPeaks,
     chatSpikes,
     durationSeconds: Math.max(audio.durationSeconds, video?.durationSeconds ?? 0),
   };
 }
 
-/** All peak windows (loud + visual + chat) for candidate generation. */
+/** All peak windows (loud + visual + emotion + chat) for candidate generation. */
 export function allPeaks(signals: MediaSignals): TimeRange[] {
-  const ranges = [...signals.loudPeaks, ...signals.visualPeaks, ...signals.chatSpikes].sort((a, b) => a.start - b.start);
+  const ranges = [...signals.loudPeaks, ...(signals.visualPeaks ?? []), ...(signals.emotionPeaks ?? []), ...(signals.chatSpikes ?? [])].sort((a, b) => a.start - b.start);
   const merged: TimeRange[] = [];
   for (const range of ranges) {
     const last = merged[merged.length - 1];

@@ -8,7 +8,7 @@ import {
   selectMoments, snapCandidate, specProvenanceFor, transcriptExcerpt, refineHookStart,
   type Assumption, type MomentCandidate, type MomentSelection, type MomentSelectionOptions, type SnapOptions, type SnapResult,
 } from './moments.js';
-import { collectSignals, mergeSignals, sourcePotential, type MediaSignals, type SourcePotential } from './signals.js';
+import { collectEmotionSignals, collectSignals, mergeSignals, sourcePotential, type MediaSignals, type SourcePotential } from './signals.js';
 import { collectChatSignals } from './chat.js';
 import { renderClip, renderOutputPaths, type CaptionOptions, type LoudnessOptions, type RenderResult, type TightenOptions } from './render.js';
 import { TranscriptionCache, flattenWords, shiftTranscript, transcriptDuration, type Transcript } from './transcribe.js';
@@ -139,7 +139,9 @@ export class ClipAssembler {
       try {
         const proxy = await this.media.ingestProxy(video, { refresh: options.refreshAudio });
         const videoSignals = await collectSignals(proxy.path, { runner: this.runner, ffmpegCommand: this.ffmpegCommand }, { motion: true });
-        signals = mergeSignals(audioSignals, videoSignals);
+        const emotion = await collectEmotionSignals(proxy.path, { runner: this.runner, ffmpegCommand: this.ffmpegCommand });
+        signals = mergeSignals(audioSignals, videoSignals, [], emotion);
+        if (emotion.peaks.length) warnings.push(`Facial-expression model found ${emotion.peaks.length} expression peak(s).`);
       } catch (error) {
         warnings.push(`Visual signals unavailable (${error instanceof Error ? error.message : String(error)}); using audio only.`);
       }

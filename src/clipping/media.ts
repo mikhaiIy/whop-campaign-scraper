@@ -173,7 +173,8 @@ export class MediaCache {
     if (!fromCache) {
       await mkdir(dir, { recursive: true });
       const args = [
-        '-f', `bv*[height<=${height}]+ba/b[height<=${height}]/b/worst`,
+        '-f', `bv*[height<=${height}][vcodec^=avc1]+ba/bv*[height<=${height}]+ba/b[height<=${height}]/b/worst`,
+        '-S', 'vcodec:h264',
         '--merge-output-format', 'mp4', '--remux-video', 'mp4',
         '--no-playlist', '--no-warnings', '--retries', '2',
         '-o', join(dir, 'source.%(ext)s'),

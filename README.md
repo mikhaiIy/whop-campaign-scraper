@@ -82,21 +82,22 @@ This needs system `ffmpeg`/`ffprobe` built with `libass` and `loudnorm`.
 | `select_campaign_moments` | Transcribe and pick clip-worthy moments; cuts nothing. |
 | `produce_campaign_clips` | Cut real clips. Set `enhance: true` for the rendered vertical short. |
 
-**Moment selection** fuses four local signals: the transcript, an audio-energy
-envelope (ffmpeg `ebur128` loudness peaks), visual activity (a low-res proxy's
-scene-cut density and frame-difference motion), and — when a live-chat replay
-exists — chat-velocity spikes. The model scores each candidate on a virality
-rubric (moment type, hook line, payoff line, curiosity, emotion, stakes,
-self-containment); spans that need earlier context or contain no payoff are
-rejected, and the composite score is blended with the moment's audio energy.
-Peaks also produce candidates directly, so visual or reaction-driven moments with
-little dialogue can be selected. It then drops overlapping or near-duplicate
-picks (IoU > 0.5, bag-of-words cosine > 0.85), re-scores the shortlist in a
-second model pass, and applies MMR diversity (λ = 0.7). The cut start is moved to
-the loudest instant (the hook), not the start of the thought, and the render can
-prepend a short cold-open flash of the payoff. Each source gets a hype-potential
-grade, and footage is ranked by clippability so reactions and livestreams are
-tried before tutorials and monologues.
+**Moment selection** fuses local signals: the transcript, an audio-energy
+envelope (ffmpeg `ebur128` loudness peaks), visual activity (a low-res H.264
+proxy's scene-cut density and frame-difference motion), facial-expression peaks
+(the FER+ ONNX model via OpenCV, sampled every few seconds), and chat-velocity
+spikes (YouTube live-chat replay, Twitch VOD sampling, best-effort Kick). The
+model scores each candidate on a virality rubric (moment type, hook line, payoff
+line, curiosity, emotion, stakes, self-containment); spans that need earlier
+context or contain no payoff are rejected, and the composite score is blended
+with the moment's audio energy. Peaks also produce candidates directly, so visual
+or reaction-driven moments with little dialogue can be selected. It then drops
+overlapping or near-duplicate picks (IoU > 0.5, bag-of-words cosine > 0.85),
+re-scores the shortlist in a second model pass, and applies MMR diversity
+(λ = 0.7). The cut start is moved to the loudest instant (the hook), not the start
+of the thought, and the render can prepend a short cold-open flash of the payoff.
+Each source gets a hype-potential grade, and footage is ranked by clippability so
+reactions and livestreams are tried before tutorials and monologues.
 
 **The render stage** (`enhance: true`) tightens dead air with auto-editor,
 reframes to 1080×1920 (scale-to-cover, then crop), burns word-synced ASS captions

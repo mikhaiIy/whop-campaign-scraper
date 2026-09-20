@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import {
   parseEbur128, parseSceneChanges, loudnessPeaks, cutDensity, summarize,
   energyAt, peakTimeWithin, sourcePotential, topEnergyWindows, EMPTY_SIGNALS,
-  parseMotion, motionPeaks, mergeSignals, allPeaks,
+  parseMotion, motionPeaks, mergeSignals, allPeaks, parseEmotionOutput, emotionPeaks,
 } from '../dist/clipping/signals.js';
-import { parseLiveChat, relativeChatTimes, chatVelocity } from '../dist/clipping/chat.js';
+import { parseLiveChat, relativeChatTimes, chatVelocity, parseTwitchComments, chatSampleSpikes } from '../dist/clipping/chat.js';
 import {
   scoreCandidate, annotateSignals, applyPayoffGate, refineHookStart, buildMomentPrompt, planWindows, signalCandidates,
 } from '../dist/clipping/moments.js';
@@ -206,4 +206,48 @@ test('buildAss shifts caption times for a cold-open teaser', () => {
   ] }] };
   const { ass } = buildAss(transcript, 0, 2, { maxWordsPerCard: 2 }, 1.5);
   assert.match(ass, /Dialogue: 0,0:00:01\.50,/);
+});
+
+test('parseEmotionOutput and emotionPeaks read the FER model output', () => {
+  const stdout = JSON.stringify({ samples: [
+    { t: 0, emotion: 'neutral', confidence: 0.9 },
+    { t: 2, emotion: 'surprise', confidence: 0.8 },
+    { t: 4, emotion: 'surprise', confidence: 0.7 },
+    { t: 6, emotion: 'neutral', confidence: 0.6 },
+    { t: 8, emotion: 'happiness', confidence: 0.3 },
+  ], frames: 5 });
+  const parsed = parseEmotionOutput(stdout);
+  assert.equal(parsed.samples.length, 5);
+  assert.equal(parsed.frames, 5);
+  assert.equal(parseEmotionOutput('nope'), null);
+  const peaks = emotionPeaks(parsed.samples, { minConfidence: 0.6 });
+  assert.ok(peaks.length >= 1);
+  assert.ok(peaks.some(range => range.start <= 2 && range.end >= 4));
+});
+
+test('parseTwitchComments reads GQL video comments', () => {
+  const json = { data: { video: { comments: { edges: [
+    { node: { contentOffsetSeconds: 3 } },
+    { node: { contentOffsetSeconds: 90 } },
+    { node: { contentOffsetSeconds: 3 } },
+  ], pageInfo: { hasNextPage: false } } } } };
+  assert.deepEqual(parseTwitchComments(json), [3, 3, 90]);
+  assert.deepEqual(parseTwitchComments({}), []);
+});
+
+test('mergeSignals carries emotion samples and peaks', () => {
+  const audio = signalsFrom([[0, -20], [10, -10]]);
+  const merged = mergeSignals(audio, { ...EMPTY_SIGNALS, visualPeaks: [{ start: 5, end: 7 }] }, [], { samples: [{ t: 5, emotion: 'anger', confidence: 0.9 }], peaks: [{ start: 4, end: 6 }] });
+  assert.equal(merged.emotionPeaks.length, 1);
+  assert.ok(allPeaks(merged).some(range => range.start === 4));
+});
+
+test('chatSampleSpikes flags density outliers', () => {
+  const samples = [
+    { t: 0, value: 0.2 }, { t: 300, value: 0.3 }, { t: 600, value: 0.25 },
+    { t: 900, value: 4.0 }, { t: 1200, value: 0.2 }, { t: 1500, value: 0.3 },
+  ];
+  const spikes = chatSampleSpikes(samples, { stepSeconds: 300 });
+  assert.equal(spikes.length, 1);
+  assert.equal(spikes[0].start, 900);
 });
